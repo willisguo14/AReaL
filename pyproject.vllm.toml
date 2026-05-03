@@ -234,7 +234,14 @@ environments = [
     "sys_platform == 'darwin' and platform_machine == 'arm64'",
     "sys_platform == 'darwin' and platform_machine == 'x86_64'",
 ]
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
 override-dependencies = [
+    # nvidia-resiliency-ext 0.5.0 only publishes manylinux_2_39 wheels, while
+    # supported CUDA hosts can run older glibc images such as manylinux_2_35.
+    "nvidia-resiliency-ext<0.5.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+
     # Required by megatron-bridge but are optional (as per docs) cuda-based installs
     "transformer-engine; sys_platform == 'never'",
     "nv-grouped-gemm; sys_platform == 'never'",

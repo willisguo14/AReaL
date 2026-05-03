@@ -17,6 +17,9 @@ supported-markers = [
     "platform_machine == 'arm64' and sys_platform == 'darwin'",
     "platform_machine == 'x86_64' and sys_platform == 'darwin'",
 ]
+required-markers = [
+    "platform_machine == 'x86_64' and sys_platform == 'linux'",
+]
 
 [manifest]
 overrides = [
@@ -27,6 +30,7 @@ overrides = [
     { name = "megatron-core", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.16.0" },
     { name = "nv-grouped-gemm", marker = "sys_platform == 'never'" },
     { name = "nvidia-cudnn-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==9.16.0.29" },
+    { name = "nvidia-resiliency-ext", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "<0.5.0" },
     { name = "openai", specifier = ">=2.8.0" },
     { name = "soundfile", specifier = ">=0.12.1,<0.13.0" },
     { name = "timm", specifier = "==1.0.16" },
@@ -3499,36 +3503,6 @@ wheels = [
 ]
 
 [[package]]
-name = "nv-one-logger-core"
-version = "2.3.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "overrides", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "pydantic", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "strenum", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "toml", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "typing-extensions", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/3b/37/963095797035f371e0db6ea761f5aaccb624fc786af217115b423baeb0e2/nv_one_logger_core-2.3.1.tar.gz", hash = "sha256:cbb2f87604c78b96a302f32d87199902129d76153a73a20f8455a250b3246c1d", size = 52640, upload-time = "2025-10-29T21:11:55.812Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ee/c4/ea91554c4fcbff66057f667690101d7a4b965605741350ac661b03fa6c46/nv_one_logger_core-2.3.1-py3-none-any.whl", hash = "sha256:0c8b77bcdac4daa1ea913bf8d4afd2a057bd5526e3654ac39f67caba157341a6", size = 63066, upload-time = "2025-10-29T21:11:52.753Z" },
-]
-
-[[package]]
-name = "nv-one-logger-training-telemetry"
-version = "2.3.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "nv-one-logger-core", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "strenum", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "typing-extensions", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/c5/21/016fa067967734d52f1ccf5a2a37a1a65216f2d7053bc2b85872cce956ca/nv_one_logger_training_telemetry-2.3.1.tar.gz", hash = "sha256:8c67940ea71799afaf1f46df3ba2f52f93aea26321c6f1c1d54aae02efc2a4af", size = 44435, upload-time = "2025-10-29T21:21:42.035Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/e5/15/97e6e4ddfe5fc35bcee74a45b7c33fb73abb83713c7dfa26420b971a86c3/nv_one_logger_training_telemetry-2.3.1-py3-none-any.whl", hash = "sha256:5319443829b59378a498c3c62ac98973e14f31be675c229ff2b14e2fe109aa0b", size = 44140, upload-time = "2025-10-29T21:21:40.72Z" },
-]
-
-[[package]]
 name = "nvidia-cublas-cu12"
 version = "12.9.1.4"
 source = { registry = "https://pypi.org/simple" }
@@ -3696,21 +3670,20 @@ wheels = [
 
 [[package]]
 name = "nvidia-resiliency-ext"
-version = "0.5.0"
+version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "defusedxml", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nv-one-logger-core", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "nv-one-logger-training-telemetry", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-ml-py", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "packaging", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "psutil", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+    { name = "pynvml", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "pyyaml", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "torch", version = "2.9.1+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/99/b4324595171c3cdffb03cef070006ab9a3de7fca90a22403576ec6423b69/nvidia_resiliency_ext-0.5.0-cp311-cp311-manylinux_2_39_x86_64.whl", hash = "sha256:c4fcd006ef69300f753bb30d17efbb6bcee6699f044e3532209b2825d22e9977", size = 407027, upload-time = "2025-11-13T21:30:09.124Z" },
-    { url = "https://files.pythonhosted.org/packages/44/89/4d7f39416aa3be72ee9f1260a7af56af40f2570f5add1e039d96279a8764/nvidia_resiliency_ext-0.5.0-cp312-cp312-manylinux_2_39_x86_64.whl", hash = "sha256:eb720cd25feabef07f971d4051c7bcac2f9ec73642a9031953d2663307950cb9", size = 407963, upload-time = "2025-11-13T21:30:28.998Z" },
+    { url = "https://files.pythonhosted.org/packages/3a/53/029cc7493b5833cb8dfa201f15a1e422e2e1cc6308d34c5b0a90028a73fd/nvidia_resiliency_ext-0.4.1-cp311-cp311-manylinux_2_31_x86_64.whl", hash = "sha256:dde6034f29350ac6326cdd861ceec641bdd93be0eddbf034739f4cd9452a4dd9", size = 449189, upload-time = "2025-07-17T03:52:15.24Z" },
+    { url = "https://files.pythonhosted.org/packages/18/8b/4cb8aa2bbdf3705d3034c3f3dacdadb03b3b7dd3dc7f5200e64663fb477f/nvidia_resiliency_ext-0.4.1-cp312-cp312-manylinux_2_31_x86_64.whl", hash = "sha256:ca9f8de465af345952bedbea53c90c0e2323d88cfd830ded0e806fad91845c0e", size = 450280, upload-time = "2025-07-17T03:49:55.327Z" },
 ]
 
 [[package]]
@@ -4164,15 +4137,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/d3/f3/274d07f4702728b43
 wheels = [
     { url = "https://files.pythonhosted.org/packages/92/f0/ad0074d6726fed86bb0bba1b9307cbbd67a2af5debd3540d66c69298a001/outlines_core-0.1.26-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:a84b7cd2fb6268bf990dd3d479ffb4fa0bace6f571cb85b15b6cdb44b84f5b69", size = 343264, upload-time = "2024-12-12T23:38:21.763Z" },
     { url = "https://files.pythonhosted.org/packages/e2/1d/a36292b6198986bd9c3ff8c24355deb82ed5475403379ee40b5b5473e2e3/outlines_core-0.1.26-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:e86a1bb46adc5cbf6dfd7a7fe4105e0e2a4c6e041732a053126b41c521a1f223", size = 343201, upload-time = "2024-12-12T23:38:34.631Z" },
-]
-
-[[package]]
-name = "overrides"
-version = "7.7.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/36/86/b585f53236dec60aba864e050778b25045f857e17f6e5ea0ae95fe80edd2/overrides-7.7.0.tar.gz", hash = "sha256:55158fa3d93b98cc75299b1e67078ad9003ca27945c76162c1c0766d6f91820a", size = 22812, upload-time = "2024-01-27T21:01:33.423Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/2c/ab/fc8290c6a4c722e5514d80f62b2dc4c4df1a68a41d1364e625c35990fcf3/overrides-7.7.0-py3-none-any.whl", hash = "sha256:c7ed9d062f78b8e4c1a7b70bd8796b35ead4d9f510227ef9c5dc7626c60d7e49", size = 17832, upload-time = "2024-01-27T21:01:31.393Z" },
 ]
 
 [[package]]
@@ -4802,6 +4766,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c9/a8/b917096b1accc9acd878819a49d3d84875731a41eb665f6ebc826b1af99e/pynacl-1.6.2-cp38-abi3-manylinux_2_34_x86_64.whl", hash = "sha256:c8a231e36ec2cab018c4ad4358c386e36eede0319a0c41fed24f840b1dac59f6", size = 1402859, upload-time = "2026-01-01T17:32:27.215Z" },
     { url = "https://files.pythonhosted.org/packages/85/42/fe60b5f4473e12c72f977548e4028156f4d340b884c635ec6b063fe7e9a5/pynacl-1.6.2-cp38-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:68be3a09455743ff9505491220b64440ced8973fe930f270c8e07ccfa25b1f9e", size = 791926, upload-time = "2026-01-01T17:32:29.314Z" },
     { url = "https://files.pythonhosted.org/packages/fa/f9/e40e318c604259301cc091a2a63f237d9e7b424c4851cafaea4ea7c4834e/pynacl-1.6.2-cp38-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:8b097553b380236d51ed11356c953bf8ce36a29a3e596e934ecabe76c985a577", size = 1363101, upload-time = "2026-01-01T17:32:31.263Z" },
+]
+
+[[package]]
+name = "pynvml"
+version = "13.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "nvidia-ml-py", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/5c/57/da7dc63a79f59e082e26a66ac02d87d69ea316b35b35b7a00d82f3ce3d2f/pynvml-13.0.1.tar.gz", hash = "sha256:1245991d9db786b4d2f277ce66869bd58f38ac654e38c9397d18f243c8f6e48f", size = 35226, upload-time = "2025-09-05T20:33:25.377Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d7/4a/cac76c174bb439a0c46c9a4413fcbea5c6cabfb01879f7bbdb9fdfaed76c/pynvml-13.0.1-py3-none-any.whl", hash = "sha256:e2b20e0a501eeec951e2455b7ab444759cf048e0e13a57b08049fa2775266aa8", size = 28810, upload-time = "2025-09-05T20:33:24.13Z" },
 ]
 
 [[package]]
@@ -5962,15 +5938,6 @@ wheels = [
 ]
 
 [[package]]
-name = "strenum"
-version = "0.4.15"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/85/ad/430fb60d90e1d112a62ff57bdd1f286ec73a2a0331272febfddd21f330e1/StrEnum-0.4.15.tar.gz", hash = "sha256:878fb5ab705442070e4dd1929bb5e2249511c0bcf2b0eeacf3bcd80875c82eff", size = 23384, upload-time = "2023-06-29T22:02:58.399Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/81/69/297302c5f5f59c862faa31e6cb9a4cd74721cd1e052b38e464c5b402df8b/StrEnum-0.4.15-py3-none-any.whl", hash = "sha256:a30cda4af7cc6b5bf52c8055bc4bf4b2b6b14a93b574626da33df53cf7740659", size = 8851, upload-time = "2023-06-29T22:02:56.947Z" },
-]
-
-[[package]]
 name = "swanboard"
 version = "0.1.9b1"
 source = { registry = "https://pypi.org/simple" }
@@ -6431,8 +6398,8 @@ dependencies = [
     { name = "torch", version = "2.9.1+cu129", source = { registry = "https://download.pytorch.org/whl/cu129" }, marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
 ]
 wheels = [
-    { url = "https://download-r2.pytorch.org/whl/cu129/torchvision-0.24.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl", upload-time = "2025-11-15T18:12:56Z" },
-    { url = "https://download-r2.pytorch.org/whl/cu129/torchvision-0.24.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl", upload-time = "2025-11-15T18:12:56Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu129/torchvision-0.24.1%2Bcu129-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:7e2e4f29d8e8b00f44917efd0710b85936fe5f2083a0e112e8e382d8c857b568", upload-time = "2026-04-27T19:00:13Z" },
+    { url = "https://download-r2.pytorch.org/whl/cu129/torchvision-0.24.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:b91365669f0ca775e49f941fd542e89759e544bf5982b043b9e447f785179856", upload-time = "2026-04-27T19:00:14Z" },
 ]
 
 [[package]]
