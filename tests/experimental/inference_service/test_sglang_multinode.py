@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import sys
 from unittest.mock import patch
 
 from areal.api.cli_args import SGLangConfig
@@ -100,3 +101,12 @@ class TestSGLangMultiNode:
         assert "--nnodes" in cmd_str
         assert "--node-rank" in cmd_str
         assert "--dist-init-addr" in cmd_str
+
+    def test_build_cmd_uses_current_interpreter(self):
+        """SGLang subprocesses should use the active venv interpreter."""
+        cmd = self._build_cmd()
+        assert cmd[:3] == [
+            sys.executable,
+            "-m",
+            "areal.experimental.inference_service.sglang.launch_server",
+        ]

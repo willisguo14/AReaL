@@ -77,9 +77,9 @@ class SlurmScheduler(Scheduler):
         trial_name: str | None = None,
         fileroot: str | None = None,
         cluster_name: str | None = None,
-        container_type: str = "apptainer",
-        container_mounts: str | None = "/storage:/storage",
-        srun_additional_args: str = "--unbuffered --mpi=pmi2 -K --chdir $PWD",
+        container_type: str | None = None,
+        container_mounts: str | None = None,
+        srun_additional_args: str | None = None,
         startup_timeout: float = 300.0,
         health_check_interval: float = 5.0,
         enable_tms_offload: bool | None = None,
@@ -894,18 +894,32 @@ class SlurmScheduler(Scheduler):
         bash_cmds_str = ";\n".join(bash_cmds)
         cmd = f"bash -c {shlex.quote(bash_cmds_str)}"
 
+        container_type = self.container_type or spec.container_type
+        container_mounts = (
+            self.container_mounts if self.container_mounts is not None else spec.mount
+        )
+        srun_additional_args = self.srun_additional_args or spec.srun_additional_args
+
         # Build final command and export string
-        if self.container_type == "apptainer":
+        if container_type == "apptainer":
             # For apptainer, pass env vars to singularity
             env_string = " ".join(f"--env {k}={v}" for k, v in env_vars_dict.items())
             final_cmd = "singularity exec --no-home --writable-tmpfs --nv"
-            if self.container_mounts:
-                final_cmd += f" --bind {self.container_mounts}"
+            if container_mounts:
+                final_cmd += f" --bind {container_mounts}"
             final_cmd += f" {env_string}"
             final_cmd += f" {spec.image}"
             final_cmd += f" {cmd}"
-        else:  # native
-            final_cmd = cmd
+        elif container_type == "none":
+            env_string = " ".join(
+                f"{k}={shlex.quote(str(v))}" for k, v in env_vars_dict.items()
+            )
+            final_cmd = f"env {env_string} {cmd}" if env_string else cmd
+        else:
+            raise ValueError(
+                f"Unsupported container type: {container_type}. "
+                "Supported types are 'apptainer' and 'none'."
+            )
 
         srun_flags = [
             f"--nodes={nodes}",
@@ -922,7 +936,7 @@ class SlurmScheduler(Scheduler):
 
         # Build srun command with streaming log pipeline
         srun_cmd = (
-            f"srun {self.srun_additional_args} {' '.join(srun_flags)} {final_cmd}"
+            f"srun {srun_additional_args} {' '.join(srun_flags)} {final_cmd}"
         )
         log_pipeline = build_streaming_log_cmd(srun_cmd, role_log, merged_log, role)
 

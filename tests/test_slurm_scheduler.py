@@ -343,6 +343,49 @@ def test_scheduler_initialization_with_overrides(tmp_path):
     assert scheduler.trial_name == "trial_001"
 
 
+def test_no_container_sbatch(tmp_path):
+    """Test that SchedulingSpec.container_type=none runs without Singularity."""
+    fileroot = tmp_path / "runs"
+    name_resolve_root = fileroot / "name_resolve"
+    fileroot.mkdir()
+    name_resolve_root.mkdir()
+
+    config = BaseExperimentConfig(
+        experiment_name="test_native",
+        trial_name="trial_001",
+    )
+    config.cluster.n_gpus_per_node = 8
+    config.cluster.fileroot = str(fileroot)
+    config.cluster.name_resolve.nfs_record_root = str(name_resolve_root)
+
+    scheduler = SlurmScheduler(exp_config=config)
+    spec = SchedulingSpec(
+        cpu=2,
+        gpu=1,
+        mem=4,
+        cmd="/tmp/areal/.venv/bin/python -m areal.infra.rpc.rpc_server",
+        container_type="none",
+        env_vars={"AREAL_TEST_ENV": "native"},
+    )
+
+    script = scheduler._generate_sbatch_script(
+        role="actor",
+        replicas=8,
+        nodes=1,
+        total_gpus=8,
+        cpus_per_task=2,
+        mem_per_task=4 * 1024,
+        schedulings=[spec],
+        nodelist=None,
+        exclude=None,
+    )
+
+    assert "singularity exec" not in script
+    assert "/tmp/areal/.venv/bin/python -m areal.infra.rpc.rpc_server" in script
+    assert "AREAL_TEST_ENV=native" in script
+    assert " env AREAL_TEST_ENV=native bash -c " in script
+
+
 def test_scheduler_no_config_no_gpus_fails():
     """Test that initialization fails without config or n_gpus_per_node."""
     with pytest.raises(
