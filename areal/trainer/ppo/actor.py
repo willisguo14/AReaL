@@ -445,7 +445,15 @@ def grpo_loss_fn(
 
     # Apply M2PO masking if threshold is set
     if m2_threshold is not None:
+        loss_mask_before_m2 = loss_mask
         loss_mask = _apply_m2po_masking(old_logp, prox_logp, loss_mask, m2_threshold)
+        _log_m2po_stats(
+            entropy=entropy,
+            versions=input_data.get("versions"),
+            current_version=current_version,
+            loss_mask_before_m2=loss_mask_before_m2,
+            loss_mask_after_m2=loss_mask,
+        )
 
     # Use SAPO or PPO loss
     if use_sapo_loss:
@@ -853,6 +861,107 @@ def _get_m2po_loss_mask(
 # =============================================================================
 # Logging Helper Functions
 # =============================================================================
+
+
+def _log_m2po_stats(
+    entropy: torch.Tensor,
+    versions: torch.Tensor | None,
+    current_version: int | None,
+    loss_mask_before_m2: torch.Tensor,
+    loss_mask_after_m2: torch.Tensor,
+) -> None:
+    """Log M2PO mask, entropy, and staleness diagnostics."""
+    valid_before_m2 = loss_mask_before_m2.bool()
+    kept_tokens = loss_mask_after_m2.bool()
+    masked_tokens = valid_before_m2 & ~kept_tokens
+
+    with stats_tracker.scope("m2"):
+        stats_tracker.denominator(tokens_before_m2=valid_before_m2)
+        stats_tracker.stat(
+            mask_ratio=masked_tokens.float(),
+            denominator="tokens_before_m2",
+            reduce_type=stats_tracker.ReduceType.AVG,
+        )
+
+        with stats_tracker.scope("entropy"):
+            stats_tracker.denominator(
+                masked_tokens=masked_tokens,
+                kept_tokens=kept_tokens,
+            )
+            stats_tracker.stat(
+                masked=entropy.float(),
+                denominator="masked_tokens",
+            )
+            stats_tracker.stat(
+                kept=entropy.float(),
+                denominator="kept_tokens",
+            )
+
+        if versions is not None and current_version is not None:
+            _log_m2po_staleness_stats(
+                versions=versions,
+                current_version=current_version,
+                valid_tokens=valid_before_m2,
+                masked_tokens=masked_tokens,
+            )
+
+
+def _log_m2po_staleness_stats(
+    versions: torch.Tensor,
+    current_version: int,
+    valid_tokens: torch.Tensor,
+    masked_tokens: torch.Tensor,
+) -> None:
+    """Log M2PO mask rates and token distributions by exact token staleness."""
+    generated_tokens = valid_tokens & (versions >= 0)
+    if not generated_tokens.any():
+        return
+
+    staleness = current_version - versions
+    nonnegative_generated_tokens = generated_tokens & (staleness >= 0)
+    if not nonnegative_generated_tokens.any():
+        return
+
+    masked_generated_tokens = masked_tokens & nonnegative_generated_tokens
+    staleness_values = (
+        torch.unique(staleness[nonnegative_generated_tokens]).detach().cpu().tolist()
+    )
+
+    with stats_tracker.scope("stale"):
+        for staleness_value in sorted(int(x) for x in staleness_values):
+            tokens_at_staleness = nonnegative_generated_tokens & (
+                staleness == staleness_value
+            )
+            masked_at_staleness = masked_generated_tokens & (
+                staleness == staleness_value
+            )
+
+            with stats_tracker.scope(str(staleness_value)):
+                stats_tracker.denominator(
+                    tokens_at_staleness=tokens_at_staleness,
+                    generated_tokens=nonnegative_generated_tokens,
+                )
+                stats_tracker.stat(
+                    mask_rate=masked_at_staleness.float(),
+                    denominator="tokens_at_staleness",
+                    reduce_type=stats_tracker.ReduceType.AVG,
+                )
+                stats_tracker.stat(
+                    token_fraction=tokens_at_staleness.float(),
+                    denominator="generated_tokens",
+                    reduce_type=stats_tracker.ReduceType.AVG,
+                )
+
+                if masked_generated_tokens.any():
+                    stats_tracker.denominator(
+                        masked_generated_tokens=masked_generated_tokens,
+                    )
+                    stats_tracker.stat(
+                        masked_fraction=masked_at_staleness.float(),
+                        denominator="masked_generated_tokens",
+                        reduce_type=stats_tracker.ReduceType.AVG,
+                    )
+
 
 _EPSILON = 1e-8  # Small constant for numerical stability in relative error calculations
 

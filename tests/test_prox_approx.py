@@ -274,6 +274,109 @@ def test_import_success():
     assert callable(compute_prox_logp_approximations)
 
 
+class TestM2POMetricsLogging:
+    """Test suite for M2PO-specific metrics logging."""
+
+    def setup_method(self):
+        from areal.utils import stats_tracker
+
+        stats_tracker.export(reset=True)
+
+    def teardown_method(self):
+        from areal.utils import stats_tracker
+
+        stats_tracker.export(reset=True)
+
+    def test_m2po_logs_mask_ratio_and_entropy_splits(self):
+        """M2PO logs token mask ratio and entropy for masked vs kept tokens."""
+        from areal.trainer.ppo.actor import grpo_loss_fn
+        from areal.utils import stats_tracker
+
+        logprobs = torch.tensor([[0.0, -0.1, -1.0, -0.2]], dtype=torch.float32)
+        entropy = torch.tensor([[0.1, 0.2, 0.9, 0.4]], dtype=torch.float32)
+        input_data = {
+            "input_ids": torch.tensor([[1, 2, 3, 4]], dtype=torch.int64),
+            "logprobs": torch.zeros(1, 4, dtype=torch.float32),
+            "advantages": torch.ones(1, 4, dtype=torch.float32),
+            "loss_mask": torch.ones(1, 4, dtype=torch.bool),
+            # M2 values: [0.0, 0.01, 1.0, 0.04]. Threshold masks only token index 2.
+            "prox_logp": logprobs.clone(),
+            "versions": torch.tensor([[3, 3, 2, -1]], dtype=torch.int32),
+        }
+
+        with stats_tracker.scope("ppo_actor"):
+            with stats_tracker.scope("update"):
+                loss = grpo_loss_fn(
+                    logprobs=logprobs,
+                    entropy=entropy,
+                    input_data=input_data,
+                    eps_clip=0.2,
+                    eps_clip_higher=None,
+                    c_clip=None,
+                    m2_threshold=0.05,
+                    current_version=5,
+                    prox_logp_method="recompute",
+                )
+
+        stats = stats_tracker.export(reset=True)
+
+        assert isinstance(loss, torch.Tensor)
+        assert stats["ppo_actor/update/m2/mask_ratio"] == pytest.approx(0.25)
+        assert stats["ppo_actor/update/m2/entropy/masked/avg"] == pytest.approx(0.9)
+        assert stats["ppo_actor/update/m2/entropy/kept/avg"] == pytest.approx(
+            (0.1 + 0.2 + 0.4) / 3
+        )
+
+    def test_m2po_logs_staleness_distribution_for_masked_tokens(self):
+        """M2PO logs mask rate and distributions for each generated-token staleness."""
+        from areal.trainer.ppo.actor import grpo_loss_fn
+        from areal.utils import stats_tracker
+
+        logprobs = torch.tensor([[0.0, -0.1, -1.0, -0.2]], dtype=torch.float32)
+        input_data = {
+            "input_ids": torch.tensor([[1, 2, 3, 4]], dtype=torch.int64),
+            "logprobs": torch.zeros(1, 4, dtype=torch.float32),
+            "advantages": torch.ones(1, 4, dtype=torch.float32),
+            "loss_mask": torch.ones(1, 4, dtype=torch.bool),
+            # M2 values: [0.0, 0.01, 1.0, 0.04]. Threshold masks only token index 2.
+            "prox_logp": logprobs.clone(),
+            # Generated-token staleness vs current_version=5: [2, 2, 3, prompt].
+            "versions": torch.tensor([[3, 3, 2, -1]], dtype=torch.int32),
+        }
+
+        with stats_tracker.scope("ppo_actor"):
+            with stats_tracker.scope("update"):
+                grpo_loss_fn(
+                    logprobs=logprobs,
+                    entropy=torch.ones_like(logprobs),
+                    input_data=input_data,
+                    eps_clip=0.2,
+                    eps_clip_higher=None,
+                    c_clip=None,
+                    m2_threshold=0.05,
+                    current_version=5,
+                    prox_logp_method="recompute",
+                )
+
+        stats = stats_tracker.export(reset=True)
+
+        assert stats["ppo_actor/update/m2/stale/2/mask_rate"] == pytest.approx(0.0)
+        assert stats["ppo_actor/update/m2/stale/2/token_fraction"] == pytest.approx(
+            2 / 3
+        )
+        assert stats[
+            "ppo_actor/update/m2/stale/2/masked_fraction"
+        ] == pytest.approx(0.0)
+
+        assert stats["ppo_actor/update/m2/stale/3/mask_rate"] == pytest.approx(1.0)
+        assert stats["ppo_actor/update/m2/stale/3/token_fraction"] == pytest.approx(
+            1 / 3
+        )
+        assert stats[
+            "ppo_actor/update/m2/stale/3/masked_fraction"
+        ] == pytest.approx(1.0)
+
+
 class TestProxLogpMethodEnum:
     """Test suite for ProxLogpMethod enum."""
 
