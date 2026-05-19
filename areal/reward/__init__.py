@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import concurrent.futures
+import math
 
 from math_verify.grader import verify as math_verify_verify
 from math_verify.parser import ExprExtractionConfig, LatexExtractionConfig, parse
@@ -32,18 +32,15 @@ class MathVerifyWorker:
     """Thin wrapper over math_verify with configurable extraction/precision.
 
     Uses ``parse()`` + ``verify()`` directly instead of ``math_metric()``
-    so that signal-based timeouts can be disabled (``parsing_timeout=None``,
-    ``timeout_seconds=None``). This avoids ``signal.alarm()`` which only
-    works in the main thread. A thread-safe timeout is enforced via
-    ``concurrent.futures`` instead.
+    so that parsing and comparison use the same timeout.
 
     Args:
         try_extract_without_anchor: When False, only answers with explicit anchors
             (e.g., "answer = 1", "final answer = 1") are matched. When True,
             any numeric string in the text may be extracted.
         precision: Number of significant digits that must match.
-        timeout: Thread-safe timeout in seconds for the entire verify call
-            (parsing + comparison). ``None`` disables the timeout.
+        timeout: Timeout in seconds for math_verify parsing and comparison.
+            ``None`` disables the timeout.
 
     Notes:
         Tune these knobs based on dataset format and model output style.
@@ -66,17 +63,23 @@ class MathVerifyWorker:
         self.precision = precision
         self.timeout = timeout
 
+    @property
+    def _native_timeout(self) -> int | None:
+        if self.timeout is None or self.timeout <= 0:
+            return None
+        return max(1, math.ceil(self.timeout))
+
     def _verify_impl(self, response: str, ground_truth: str) -> float:
         """Core verification logic without timeout wrapper."""
         gold_parsed = parse(
             ground_truth,
             extraction_config=self.gold_extraction_target,
-            parsing_timeout=None,
+            parsing_timeout=self._native_timeout,
         )
         pred_parsed = parse(
             response,
             extraction_config=self.pred_extraction_target,
-            parsing_timeout=None,
+            parsing_timeout=self._native_timeout,
         )
         if not gold_parsed or not pred_parsed:
             return 0.0
@@ -84,23 +87,13 @@ class MathVerifyWorker:
             gold_parsed,
             pred_parsed,
             float_rounding=self.precision,
-            timeout_seconds=None,
+            timeout_seconds=self._native_timeout,
         )
         return 1.0 if result else 0.0
 
     def verify(self, response: str, ground_truth: str) -> float:
         try:
-            if self.timeout is None:
-                return self._verify_impl(response, ground_truth)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(self._verify_impl, response, ground_truth)
-                return future.result(timeout=self.timeout)
-        except concurrent.futures.TimeoutError:
-            logger.warning(
-                f"Timeout ({self.timeout}s) in MathVerifyWorker.verify for "
-                f"response={response!r} and ground_truth={ground_truth!r}",
-            )
-            return 0.0
+            return self._verify_impl(response, ground_truth)
         except Exception:
             logger.warning(
                 f"Exception in MathVerifyWorker.verify for response={response} and ground_truth={ground_truth}",
