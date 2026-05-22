@@ -1,4 +1,18 @@
-from areal.reward import geometry3k_reward_fn, get_math_verify_worker, gsm8k_reward_fn
+import multiprocessing
+import time
+
+from areal.reward import (
+    MathVerifyWorker,
+    geometry3k_reward_fn,
+    get_math_verify_worker,
+    gsm8k_reward_fn,
+)
+
+
+def _verify_pathological_exponent(queue):
+    start = time.monotonic()
+    reward = MathVerifyWorker(timeout=1).verify(r"$2^{2^{2008}}$", "1")
+    queue.put((reward, time.monotonic() - start))
 
 
 class TestGSM8KRewardFn:
@@ -179,6 +193,28 @@ class TestRewardEdgeCases:
             answer=None,
         )
         assert reward == 0.0, "None answer should return 0.0"
+
+
+class TestMathVerifyTimeouts:
+    """Test timeout behavior for pathological math-verify inputs."""
+
+    def test_worker_times_out_pathological_exponent(self):
+        """Pathological expressions should return 0 instead of hanging."""
+        ctx = multiprocessing.get_context("fork")
+        queue = ctx.Queue()
+        proc = ctx.Process(target=_verify_pathological_exponent, args=(queue,))
+        proc.start()
+        proc.join(timeout=4)
+
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=1)
+            assert False, "MathVerifyWorker did not return before the timeout budget"
+
+        assert proc.exitcode == 0
+        reward, elapsed = queue.get(timeout=1)
+        assert reward == 0.0
+        assert elapsed < 3
 
 
 class TestGSM8KAdvanced:

@@ -154,11 +154,9 @@ class AsyncRewardWrapper:
             except TimeoutError:
                 logger.warning(
                     f"Computing reward timeout after {self.timeout_seconds}s "
-                    f"(attempt {attempt + 1}/{self.max_retries + 1}). "
-                    f"{'Returning 0.' if is_last else 'Retrying...'}"
+                    f"(attempt {attempt + 1}/{self.max_retries + 1}). Returning 0."
                 )
-                if is_last:
-                    return 0
+                return 0
             except BrokenProcessPool:
                 logger.warning(
                     f"ProcessPoolExecutor broken (attempt {attempt + 1}/{self.max_retries + 1}). "
