@@ -535,16 +535,19 @@ class RemoteSGLangEngine(InferenceEngine):
     ) -> RolloutController:
         return RolloutController(cls, config=config, scheduler=scheduler)
 
-    def clear_batches(self, shard_ids: list[str]) -> None:
+    def clear_batches(self, shard_ids: list[str] | None = None) -> None:
         """Drain this worker's client-side RTensor fetch buffer.
 
         Called via RPC by ``TrainController.clear_batches`` at step end so
         cross-node consumer DP heads release cached tensors. See #1209.
-        Upstream ``TrainController.clear_batches`` guards against empty
-        input, so ``shard_ids`` is always a non-empty ``list[str]``.
+        Non-head ranks may receive no positional arguments when this RPC is
+        sent with ``broadcast=False``; they do not localize the RTensor payload
+        and can safely no-op.
         """
         from areal.infra.rpc.rtensor import clear_fetch_buffer
 
+        if not shard_ids:
+            return
         clear_fetch_buffer(shard_ids)
 
     def fetch_buffer_stats(self) -> dict[str, int]:
