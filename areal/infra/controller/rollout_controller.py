@@ -1088,6 +1088,8 @@ class RolloutController:
             count_key = k + "__count"
             if count_key in counts and counts[count_key] > 0:
                 final_stats[k] = v / counts[count_key]
+        if self._dispatcher is not None:
+            final_stats.update(self.dispatcher.export_async_metrics())
         return final_stats
 
     def config_perf_tracer(self, config: PerfTracerConfig, role: str) -> None:
