@@ -3,6 +3,7 @@
 from __future__ import annotations  # noqa
 
 import json
+import math
 import os
 import random
 import threading
@@ -249,6 +250,7 @@ _MAX_FETCH_BATCH_SIZE = 100
 _SHUTDOWN_TIMEOUT_SECONDS = 2.0
 # Timeout for "wait" and "wait_for_task" if timeout parameter is None
 _DEFAULT_WAIT_TIMEOUT_SECONDS = float(7 * 24 * 3600)
+_ASYNC_TRAIN_REQUEST_PREFIX = "async/train_request"
 
 
 class WithTaskID(Protocol):
@@ -311,6 +313,91 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         # Callback support: task_id -> callback_addr
         self._task_callbacks: dict[int, str] = {}
 
+        # Metrics captured at the start of each trainer batch request.
+        self._metrics_lock = threading.Lock()
+        self._finalized_task_latencies: list[float] = []
+        self._last_train_request_accepted = 0
+        self._last_train_request_rejected = 0
+        self._last_async_metrics: dict[str, float] = {}
+
+    @staticmethod
+    def _percentile(values: list[float], percentile: float) -> float:
+        if not values:
+            raise ValueError("values must be non-empty")
+        if len(values) == 1:
+            return values[0]
+        sorted_values = sorted(values)
+        rank = (len(sorted_values) - 1) * percentile
+        lower = math.floor(rank)
+        upper = math.ceil(rank)
+        if lower == upper:
+            return sorted_values[lower]
+        weight = rank - lower
+        return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
+
+    def _record_finalized_task_latency(self, latency: float) -> None:
+        with self._metrics_lock:
+            self._finalized_task_latencies.append(latency)
+
+    def _wrap_task_with_metrics(
+        self, task_fn: Callable[[], Awaitable[TResult | None]]
+    ) -> Callable[[], Awaitable[TResult | None]]:
+        async def _timed_task_fn() -> TResult | None:
+            start_time = time.perf_counter()
+            try:
+                return await task_fn()
+            finally:
+                self._record_finalized_task_latency(time.perf_counter() - start_time)
+
+        return _timed_task_fn
+
+    def capture_train_request_metrics(self) -> dict[str, float]:
+        with self._result_cv:
+            ready_tasks = len(self._pending_results)
+
+        rollout_stats = self.staleness_manager.get_stats()
+        capacity_tasks = self.staleness_manager.get_capacity()
+
+        with self._metrics_lock:
+            accepted_tasks = max(
+                0, rollout_stats.accepted - self._last_train_request_accepted
+            )
+            rejected_tasks = max(
+                0, rollout_stats.rejected - self._last_train_request_rejected
+            )
+            latencies = self._finalized_task_latencies
+            self._finalized_task_latencies = []
+            self._last_train_request_accepted = rollout_stats.accepted
+            self._last_train_request_rejected = rollout_stats.rejected
+
+            metrics: dict[str, float] = {
+                f"{_ASYNC_TRAIN_REQUEST_PREFIX}/ready_tasks": ready_tasks,
+                f"{_ASYNC_TRAIN_REQUEST_PREFIX}/inflight_tasks": rollout_stats.running,
+                f"{_ASYNC_TRAIN_REQUEST_PREFIX}/capacity_tasks": capacity_tasks,
+                f"{_ASYNC_TRAIN_REQUEST_PREFIX}/accepted_tasks": accepted_tasks,
+                f"{_ASYNC_TRAIN_REQUEST_PREFIX}/rejected_tasks": rejected_tasks,
+            }
+            if latencies:
+                metrics.update(
+                    {
+                        f"{_ASYNC_TRAIN_REQUEST_PREFIX}/task_latency/p50": self._percentile(
+                            latencies, 0.50
+                        ),
+                        f"{_ASYNC_TRAIN_REQUEST_PREFIX}/task_latency/p95": self._percentile(
+                            latencies, 0.95
+                        ),
+                        f"{_ASYNC_TRAIN_REQUEST_PREFIX}/task_latency/max": max(
+                            latencies
+                        ),
+                    }
+                )
+            self._last_async_metrics = metrics
+            return dict(metrics)
+
+    def export_async_metrics(self) -> dict[str, float]:
+        with self._metrics_lock:
+            return dict(self._last_async_metrics)
+
     def _set_thread_exception(self, exc: Exception):
         """Store exception from background thread for fail-fast behavior."""
         with self._thread_exception_lock:
@@ -367,7 +454,7 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
                 if task_input is None:
                     continue
 
-                task_fn = self.task_factory(task_input)
+                task_fn = self._wrap_task_with_metrics(self.task_factory(task_input))
                 try:
                     self.runner.submit(task_fn, task_id=task_input.task_id)
                     self.staleness_manager.on_rollout_submitted()
@@ -667,6 +754,8 @@ class BatchTaskDispatcher(Generic[TInput, TResult]):
         RuntimeError
             If the input generator is exhausted before the batch is complete.
         """
+        self.capture_train_request_metrics()
+
         accepted_cnt = 0
         total_attempts = 0
         results = []
@@ -1347,6 +1436,11 @@ class WorkflowExecutor:
 
     def is_paused(self):
         return self.dispatcher.is_paused()
+
+    def export_async_metrics(self) -> dict[str, float]:
+        if self._dispatcher is None:
+            return {}
+        return self.dispatcher.export_async_metrics()
 
     @property
     def staleness_manager(self) -> StalenessManager:

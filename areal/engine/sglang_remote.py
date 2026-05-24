@@ -527,7 +527,12 @@ class RemoteSGLangEngine(InferenceEngine):
         return self._engine.onload(tags=tags)
 
     def export_stats(self) -> dict[str, float]:
-        return stats_tracker.export_all(reduce_group=None)
+        stats = stats_tracker.export_all(reduce_group=None)
+        try:
+            stats.update(self.workflow_executor.export_async_metrics())
+        except RuntimeError:
+            pass
+        return stats
 
     @classmethod
     def as_controller(
