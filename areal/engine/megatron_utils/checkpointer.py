@@ -43,6 +43,35 @@ from areal.utils import logging, stats_tracker
 logger = logging.getLogger("MegatronCheckpointer")
 
 
+def _build_sharded_state_dict_metadata() -> dict:
+    return {
+        "distrib_optim_sharding_type": "dp_reshardable",
+        "singleton_local_shards": False,
+        "chained_optim_avoid_prefix": True,
+        "dp_cp_group": mpu.get_data_parallel_group(with_context_parallel=True),
+    }
+
+
+def _clean_sharded_state_dict_metadata(metadata: dict | None) -> dict | None:
+    if metadata is None:
+        return None
+    metadata = dict(metadata)
+    metadata.pop("dp_cp_group", None)
+    return metadata
+
+
+def _load_sharded_state_dict_metadata(ckpt_dir: str) -> dict:
+    metadata = dist_checkpointing.load_content_metadata(ckpt_dir)
+    if metadata is None:
+        metadata = _clean_sharded_state_dict_metadata(
+            _build_sharded_state_dict_metadata()
+        )
+    else:
+        metadata = dict(metadata)
+    metadata["dp_cp_group"] = mpu.get_data_parallel_group(with_context_parallel=True)
+    return metadata
+
+
 def log_with_rank(message: str, rank: int, log_only_rank_0: bool = False):
     if not log_only_rank_0 or rank == 0:
         logger.info(f"[Rank {rank}] {message}")
@@ -57,7 +86,10 @@ def get_device_name() -> str:
 
 
 def save_dist_checkpointing(
-    sharded_state_dict, ckpt_path, async_save=False
+    sharded_state_dict,
+    ckpt_path,
+    async_save=False,
+    content_metadata: dict | None = None,
 ) -> AsyncRequest | None:
     validate_sharding_integrity = True
     # Get checkpointing strategies
@@ -77,6 +109,7 @@ def save_dist_checkpointing(
         sharded_strategy=save_strategy,
         async_sharded_save=async_save,
         validate_access_integrity=validate_sharding_integrity,
+        content_metadata=content_metadata,
     )
     if async_save:
         save_kwargs["async_strategy"] = "mcore"
@@ -278,9 +311,13 @@ class MegatronCheckpointManager:
         with_model: bool = True,
         with_optimizer: bool = True,
         with_rng: bool = True,
+        is_loading: bool = False,
+        metadata: dict | None = None,
     ):
         # For save dist checkpointing
         state_dict = {}
+        if metadata is None and (with_model or with_optimizer):
+            metadata = _build_sharded_state_dict_metadata()
 
         # All ranks Save Model to reduce memory pressure
         if with_model:
@@ -293,12 +330,14 @@ class MegatronCheckpointManager:
                     key = "model"
                 if hasattr(model, "module"):
                     model = model.module
-                state_dict[key] = model.sharded_state_dict()
+                state_dict[key] = model.sharded_state_dict(metadata=metadata)
 
         # Optimizer State Dict
         if with_optimizer:
             torch.distributed.barrier()
-            optimizer_sharded_states = self.optimizer.sharded_state_dict(state_dict)
+            optimizer_sharded_states = self.optimizer.sharded_state_dict(
+                state_dict, is_loading=is_loading, metadata=metadata
+            )
             state_dict["optimizer"] = optimizer_sharded_states
 
             if self.lr_scheduler is not None:
@@ -308,7 +347,7 @@ class MegatronCheckpointManager:
         # RNG States State Dict
         if with_rng:
             torch.distributed.barrier()
-            rng_state = self.get_rng_state()
+            rng_state = self.get_rng_state(data_parallel_random_init=True)
             state_dict["rng_state"] = rng_state
 
         return state_dict
@@ -316,7 +355,13 @@ class MegatronCheckpointManager:
     def load_rng_states(self, rng_states, data_parallel_random_init=False):
         # access rng_state for data parallel rank
         if data_parallel_random_init:
-            rng_states = rng_states[mpu.get_data_parallel_rank()]
+            dp_rank = mpu.get_data_parallel_rank()
+            if dp_rank < len(rng_states):
+                rng_states = rng_states[dp_rank]
+            else:
+                # Backward compatibility for checkpoints that stored a single
+                # local RNG state per DP replica before DP RNG gathering.
+                rng_states = rng_states[0]
         else:
             rng_states = rng_states[0]
         random.setstate(rng_states["random_rng_state"])
@@ -350,10 +395,15 @@ class MegatronCheckpointManager:
                 f"Checkpoint path {local_path} does not exist."
             )
         dist_checkpoint_path = local_path
+        metadata = _load_sharded_state_dict_metadata(dist_checkpoint_path)
 
         # Get State Dict for loading
         sharded_state_dict = self.generate_state_dict(
-            with_model, with_optimizer, with_rng
+            with_model,
+            with_optimizer,
+            with_rng,
+            is_loading=True,
+            metadata=metadata,
         )
         # Load Dist Checkpointing
         state_dict = load_dist_checkpointing(
@@ -414,7 +464,7 @@ class MegatronCheckpointManager:
                 f"RNG state dict not found in {state_dict.keys()}. Please check the checkpoint file {local_path}."
             )
             rng_state = state_dict["rng_state"]
-            self.load_rng_states(rng_state)
+            self.load_rng_states(rng_state, data_parallel_random_init=True)
             log_with_rank(f"Loaded RNG states from {local_path}", rank=self.rank)
 
     def save_checkpoint(
@@ -434,13 +484,21 @@ class MegatronCheckpointManager:
         # writes their metadata.json. Pending saves remain queued.
         self._reap_finished_async_saves()
 
+        metadata = _build_sharded_state_dict_metadata()
         # Generate state dict for saving
-        state_dict = self.generate_state_dict(with_model, with_optimizer, with_rng)
+        state_dict = self.generate_state_dict(
+            with_model,
+            with_optimizer,
+            with_rng,
+            is_loading=False,
+            metadata=metadata,
+        )
         # Start Async save if enabled
         async_save_request = save_dist_checkpointing(
             sharded_state_dict=state_dict,
             ckpt_path=dist_checkpoint_path,
             async_save=self.async_save,
+            content_metadata=_clean_sharded_state_dict_metadata(metadata),
         )
 
         if self.async_save:
