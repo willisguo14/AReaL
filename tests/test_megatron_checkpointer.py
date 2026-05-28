@@ -12,6 +12,9 @@ def _install_fake_megatron(monkeypatch):
     mapping = types.ModuleType("megatron.core.dist_checkpointing.mapping")
     serialization = types.ModuleType("megatron.core.dist_checkpointing.serialization")
     strategies = types.ModuleType("megatron.core.dist_checkpointing.strategies")
+    async_utils = types.ModuleType(
+        "megatron.core.dist_checkpointing.strategies.async_utils"
+    )
     fully_parallel = types.ModuleType(
         "megatron.core.dist_checkpointing.strategies.fully_parallel"
     )
@@ -40,9 +43,14 @@ def _install_fake_megatron(monkeypatch):
         def set_states(self, state):
             self.state = state
 
+    class FakeAsyncCallsQueue:
+        pass
+
     mapping.ShardedObject = FakeShardedObject
     serialization.get_default_load_sharded_strategy = lambda ckpt_dir: object()
     serialization.get_default_save_sharded_strategy = lambda backend: object()
+    async_utils.AsyncCallsQueue = FakeAsyncCallsQueue
+    async_utils.AsyncRequest = object
     fully_parallel.FullyParallelLoadStrategyWrapper = (
         FakeFullyParallelLoadStrategyWrapper
     )
@@ -65,6 +73,7 @@ def _install_fake_megatron(monkeypatch):
     dist_checkpointing.mapping = mapping
     dist_checkpointing.serialization = serialization
     dist_checkpointing.load_content_metadata = lambda ckpt_dir: None
+    strategies.async_utils = async_utils
     strategies.fully_parallel = fully_parallel
 
     modules = {
@@ -74,6 +83,7 @@ def _install_fake_megatron(monkeypatch):
         "megatron.core.dist_checkpointing.mapping": mapping,
         "megatron.core.dist_checkpointing.serialization": serialization,
         "megatron.core.dist_checkpointing.strategies": strategies,
+        "megatron.core.dist_checkpointing.strategies.async_utils": async_utils,
         "megatron.core.dist_checkpointing.strategies.fully_parallel": fully_parallel,
         "megatron.core.mpu": mpu,
         "megatron.core.tensor_parallel": tensor_parallel,
@@ -188,6 +198,7 @@ def test_save_checkpoint_persists_serializable_metadata(monkeypatch, tmp_path):
     )
     manager.use_dist_checkpointing = True
     manager.async_save = False
+    manager._async_queue = None
 
     def fake_generate_state_dict(
         with_model=True,
@@ -260,6 +271,7 @@ def test_load_checkpoint_uses_checkpoint_metadata_for_loading(monkeypatch, tmp_p
     manager.rank = 0
     manager.use_dist_checkpointing = True
     manager.use_checkpoint_opt_param_scheduler = False
+    manager._async_queue = None
     loaded_model_state = {"weight": object()}
     loaded_optimizer_state = {"param_state": object()}
 
@@ -357,6 +369,7 @@ def test_load_checkpoint_restores_local_data_parallel_rng_state(monkeypatch, tmp
     manager.rank = 0
     manager.use_dist_checkpointing = True
     manager.use_checkpoint_opt_param_scheduler = False
+    manager._async_queue = None
 
     def fake_load_dist_checkpointing(sharded_state_dict, ckpt_dir):
         return {"rng_state": ["dp0-rng", "dp1-rng"]}

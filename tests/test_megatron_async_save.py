@@ -26,8 +26,7 @@ import pytest
 
 def _import_checkpointer():
     """Import the checkpointer module without triggering the full areal package."""
-    if "areal.engine.megatron_utils.checkpointer" in sys.modules:
-        return sys.modules["areal.engine.megatron_utils.checkpointer"]
+    sys.modules.pop("areal.engine.megatron_utils.checkpointer", None)
 
     # Stub out heavy/optional dependencies so the module loads on a CPU box
     # without Megatron or a Stager-capable torch build.
@@ -53,6 +52,9 @@ def _import_checkpointer():
     sys.modules["megatron.core"].dist_checkpointing = sys.modules[
         "megatron.core.dist_checkpointing"
     ]
+    sys.modules["megatron.core.dist_checkpointing"].load_content_metadata = MagicMock(
+        return_value=None
+    )
     sys.modules["megatron.core"].mpu = MagicMock()
     sys.modules["megatron.core"].tensor_parallel = MagicMock()
     sys.modules["megatron.core.dist_checkpointing.mapping"].ShardedObject = MagicMock()

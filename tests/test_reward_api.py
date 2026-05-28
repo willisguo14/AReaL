@@ -26,6 +26,10 @@ def _count_attempts(path) -> int:
     return path.read_text().count("attempt\n")
 
 
+def _shutdown_reward_executors():
+    AsyncRewardWrapper._atexit_shutdown_all()
+
+
 @pytest.mark.asyncio
 async def test_async_reward_wrapper_math_verify_timeout_finishes_before_outer_timeout():
     """Math-verify should finish inside the reward process before outer timeout."""
@@ -44,7 +48,7 @@ async def test_async_reward_wrapper_math_verify_timeout_finishes_before_outer_ti
         assert reward == 0.0
         assert elapsed < 3
     finally:
-        AsyncRewardWrapper._cleanup_executor(wrapper._executor_key)
+        _shutdown_reward_executors()
 
 
 @pytest.mark.asyncio
@@ -69,5 +73,4 @@ async def test_async_reward_wrapper_timeout_does_not_retry(tmp_path):
         await asyncio.sleep(0.3)
         assert _count_attempts(attempts_path) == 1
     finally:
-        AsyncRewardWrapper._cleanup_executor(wrapper._executor_key)
-        await asyncio.sleep(0.6)
+        _shutdown_reward_executors()
