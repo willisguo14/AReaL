@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import functools
+import math
 from typing import Any
 
 import torch
@@ -38,6 +39,21 @@ from areal.utils.functional import (
 from areal.utils.perf_tracer import trace_perf
 
 logger = logging.getLogger("PPOActor")
+
+
+def _summarize_grad_cos_sims(values: list[float]) -> dict[str, float]:
+    finite_values = [float(value) for value in values if math.isfinite(float(value))]
+    if not finite_values:
+        return {}
+
+    abs_values = [abs(value) for value in finite_values]
+    return {
+        "grad_cos_sim_abs/max": max(abs_values),
+        "grad_cos_sim_abs/min": min(abs_values),
+        "grad_cos_sim_abs/avg": sum(abs_values) / len(abs_values),
+        "grad_cos_sim/max": max(finite_values),
+        "grad_cos_sim/min": min(finite_values),
+    }
 
 
 class PPOActor:
@@ -341,6 +357,7 @@ class PPOActor:
         with stats_tracker.scope("update"):
             # Get current version for proximal approximation metrics
             current_version = self.engine.get_version()
+            grad_cos_sims: list[float] = []
 
             for mb in mb_inputs.mbs:
                 train_stat = self.engine.train_batch(
@@ -362,7 +379,14 @@ class PPOActor:
                     ),
                     loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
                 )
+                grad_cos_sim = train_stat.pop("grad_cos_sim", None)
+                if grad_cos_sim is not None and math.isfinite(float(grad_cos_sim)):
+                    grad_cos_sims.append(float(grad_cos_sim))
                 stats_tracker.scalar(**train_stat)
+
+            grad_cos_summary = _summarize_grad_cos_sims(grad_cos_sims)
+            if grad_cos_summary:
+                stats_tracker.scalar(**grad_cos_summary)
 
 
 class PPOActorController(TrainController):

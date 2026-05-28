@@ -64,6 +64,7 @@ from areal.engine.core.model import (
 from areal.engine.megatron_utils.checkpointer import MegatronCheckpointManager
 from areal.engine.megatron_utils.deterministic import set_deterministic_algorithms
 from areal.engine.megatron_utils.fp8 import FP8BlockwiseTensorHelper
+from areal.engine.megatron_utils.grad_cosine import GradientCosineTracker
 from areal.engine.megatron_utils.megatron import (
     all_gather_param,
     convert_to_hf,
@@ -210,6 +211,7 @@ class MegatronEngine(TrainEngine):
         self.bridge_lora: MegatronBridgeLoRA | None = None
         self.is_vision_model: bool = False
         self.processor = None
+        self.grad_cosine_tracker = GradientCosineTracker()
 
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
         if parallel_strategy is None:
@@ -955,8 +957,22 @@ class MegatronEngine(TrainEngine):
             forward_only=False,
         )
 
-        # Step 4: Optimizer step
+        # Step 4: Capture raw gradients before optimizer transformations.
+        grad_cosine_pending = self.grad_cosine_tracker.prepare(
+            model=self.model,
+            optimizer=self.optimizer,
+            duplicated_param_names=self._duplicated_param_names,
+            device=self.device,
+        )
+
+        # Step 5: Optimizer step
         stats = self.optimizer_step()
+        grad_cos_sim = self.grad_cosine_tracker.finalize(
+            grad_cosine_pending,
+            update_successful=stats.get("update_successful", 0.0) == 1.0,
+        )
+        if grad_cos_sim is not None:
+            stats["grad_cos_sim"] = float(grad_cos_sim)
         stats["num_micro_batches"] = len(mb_list.mbs)
         return stats
 
