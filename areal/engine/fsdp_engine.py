@@ -83,6 +83,7 @@ from areal.engine.fsdp_utils import (
 )
 from areal.engine.fsdp_utils.checkpoint import DCPState
 from areal.engine.fsdp_utils.grad import fsdp2_clip_grad_norm
+from areal.engine.fsdp_utils.grad_cosine import FSDPGradientCosineTracker
 from areal.engine.fsdp_utils.optimizer import AnyPrecisionAdamW, PerLayerOptimWrapper
 from areal.engine.fsdp_utils.parallel import ParallelHelper, parallelize_model
 from areal.infra.dist_rollout import DistRolloutCoordinator
@@ -265,6 +266,7 @@ class FSDPEngine(TrainEngine):
         self._offload_depth: int = 0
         self._per_layer_optim_wrapper: PerLayerOptimWrapper | None = None
         self.enable_tree_training: bool = self.config.enable_tree_training
+        self.grad_cosine_tracker = FSDPGradientCosineTracker()
 
     @classmethod
     def from_pretrained(
@@ -792,8 +794,22 @@ class FSDPEngine(TrainEngine):
 
         self.forward_backward_batch(mb_list, process_output, forward_only=False)
 
-        # Step 4: Optimizer step
+        # Step 4: Capture raw gradients before optimizer transformations.
+        grad_cosine_pending = self.grad_cosine_tracker.prepare(
+            model=self.model,
+            fsdp_group=self.world_mesh["dp_sp"].get_group(),
+            tp_group=self.world_mesh["tp"].get_group(),
+            device=self.device,
+        )
+
+        # Step 5: Optimizer step
         stats = self.optimizer_step()
+        grad_cos_sim = self.grad_cosine_tracker.finalize(
+            grad_cosine_pending,
+            update_successful=stats.get("update_successful", 0.0) == 1.0,
+        )
+        if grad_cos_sim is not None:
+            stats["grad_cos_sim"] = float(grad_cos_sim)
         stats["num_micro_batches"] = len(mb_list.mbs)
         return stats
 
