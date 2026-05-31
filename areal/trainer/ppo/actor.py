@@ -5,6 +5,7 @@ import math
 from typing import Any
 
 import torch
+import torch.distributed as dist
 
 from areal.api import TrainEngine
 from areal.api.cli_args import MicroBatchSpec, PPOActorConfig, RejectionSamplingConfig
@@ -13,6 +14,7 @@ from areal.experimental.training_service.controller.controller import (
 )
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
+from areal.trainer.ppo.ess import compute_sequence_ess, summarize_ess_stats
 from areal.trainer.ppo.stats import infer_token_denominator
 from areal.utils import logging, stats_tracker
 from areal.utils.constants import (
@@ -54,6 +56,115 @@ def _summarize_grad_cos_sims(values: list[float]) -> dict[str, float]:
         "grad_cos_sim/max": max(finite_values),
         "grad_cos_sim/min": min(finite_values),
     }
+
+
+def _has_exact_ess_inputs(data: dict[str, Any]) -> bool:
+    return (
+        data.get("prox_logp") is not None
+        and data.get("logprobs") is not None
+        and data.get("loss_mask") is not None
+    )
+
+
+def _missing_exact_ess_inputs(data: dict[str, Any]) -> list[str]:
+    return [
+        key for key in ("prox_logp", "logprobs", "loss_mask") if data.get(key) is None
+    ]
+
+
+def _should_all_reduce_exact_ess_inputs(process_group: Any) -> bool:
+    return process_group is not None and dist.is_available() and dist.is_initialized()
+
+
+def _first_tensor_device(data: dict[str, Any]) -> torch.device | None:
+    for value in data.values():
+        if isinstance(value, torch.Tensor):
+            return value.device
+    return None
+
+
+def _dist_backend_name(process_group: Any) -> str:
+    get_backend = getattr(dist, "get_backend", None)
+    if get_backend is None:
+        return ""
+    try:
+        backend = get_backend(process_group)
+    except TypeError:
+        backend = get_backend(group=process_group)
+    return str(backend).lower()
+
+
+def _ess_collective_device(
+    data: dict[str, Any],
+    *,
+    process_group: Any,
+    engine: Any,
+) -> torch.device | None:
+    if not _should_all_reduce_exact_ess_inputs(process_group):
+        return None
+
+    backend_name = _dist_backend_name(process_group)
+    if "gloo" in backend_name:
+        return torch.device("cpu")
+    if backend_name:
+        engine_device = getattr(engine, "device", None)
+        if engine_device is not None:
+            return torch.device(engine_device)
+    return _first_tensor_device(data)
+
+
+def _has_exact_ess_inputs_on_all_dp_ranks(
+    data: dict[str, Any],
+    process_group: Any,
+    collective_device: torch.device | None,
+) -> bool:
+    local_has_exact_inputs = _has_exact_ess_inputs(data)
+    if not _should_all_reduce_exact_ess_inputs(process_group):
+        return local_has_exact_inputs
+
+    counts = torch.tensor(
+        [int(local_has_exact_inputs), 1],
+        dtype=torch.int64,
+        device=collective_device
+        if collective_device is not None
+        else _first_tensor_device(data),
+    )
+    dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=process_group)
+
+    exact_rank_count = int(counts[0].item())
+    total_rank_count = int(counts[1].item())
+    if exact_rank_count == total_rank_count:
+        return True
+    if exact_rank_count == 0:
+        return False
+
+    missing = _missing_exact_ess_inputs(data)
+    local_state = (
+        f"local missing: {', '.join(missing)}"
+        if missing
+        else "local rank has all exact ESS inputs"
+    )
+    raise RuntimeError(
+        "Mixed exact ESS inputs across DP ranks would make ESS collectives unsafe; "
+        f"{exact_rank_count}/{total_rank_count} DP ranks have exact ESS inputs "
+        f"and {local_state}."
+    )
+
+
+def _ess_tensors_on_collective_device(
+    mb: dict[str, Any],
+    collective_device: torch.device | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    prox_logp = mb["prox_logp"]
+    logprobs = mb["logprobs"]
+    loss_mask = mb["loss_mask"]
+    if collective_device is None:
+        return prox_logp, logprobs, loss_mask
+    return (
+        prox_logp.to(device=collective_device),
+        logprobs.to(device=collective_device),
+        loss_mask.to(device=collective_device),
+    )
 
 
 class PPOActor:
@@ -270,6 +381,35 @@ class PPOActor:
         batched_call(self._ppo_update, data, unpack=False)
 
     def _ppo_update(self, data: dict[str, Any]) -> None:
+        ess_scaling = getattr(self.config, "ess_scaling", None)
+        if ess_scaling is not None and not self.config.use_decoupled_loss:
+            raise RuntimeError(
+                "ess_scaling requires use_decoupled_loss=True because exact "
+                "proximal log probabilities are required for ESS."
+            )
+        if ess_scaling is not None and not getattr(
+            self.engine, "supports_optimizer_step_scale", False
+        ):
+            raise RuntimeError(
+                "ess_scaling requires an FSDP engine that supports "
+                "optimizer_step_scale."
+            )
+        data_parallel_group = getattr(self.engine, "data_parallel_group", None)
+        ess_collective_device = _ess_collective_device(
+            data,
+            process_group=data_parallel_group,
+            engine=self.engine,
+        )
+        has_exact_ess_inputs = _has_exact_ess_inputs_on_all_dp_ranks(
+            data, data_parallel_group, ess_collective_device
+        )
+        if ess_scaling is not None and not has_exact_ess_inputs:
+            missing = _missing_exact_ess_inputs(data)
+            raise RuntimeError(
+                "ess_scaling requires exact ESS inputs: prox_logp, logprobs, "
+                f"and loss_mask. Missing: {', '.join(missing)}."
+            )
+        should_compute_ess = self.config.use_decoupled_loss and has_exact_ess_inputs
         attn_mask = data["attention_mask"]
         loss_mask = data["loss_mask"]
         reward_score = data["rewards"]
@@ -358,8 +498,31 @@ class PPOActor:
             # Get current version for proximal approximation metrics
             current_version = self.engine.get_version()
             grad_cos_sims: list[float] = []
+            ess_stats = []
+            ess_lrs: list[float] = []
 
             for mb in mb_inputs.mbs:
+                ess_stat = None
+                if should_compute_ess:
+                    prox_logp, logprobs, loss_mask = _ess_tensors_on_collective_device(
+                        mb, ess_collective_device
+                    )
+                    ess_stat = compute_sequence_ess(
+                        prox_logp=prox_logp,
+                        logprobs=logprobs,
+                        loss_mask=loss_mask,
+                        scaling_config=ess_scaling,
+                        process_group=data_parallel_group,
+                    )
+                    if ess_stat is not None:
+                        ess_stats.append(ess_stat)
+
+                train_batch_kwargs = {}
+                if ess_scaling is not None:
+                    train_batch_kwargs["optimizer_step_scale"] = (
+                        ess_stat.ess_lr_scale if ess_stat is not None else 1.0
+                    )
+
                 train_stat = self.engine.train_batch(
                     mb,
                     loss_fn=functools.partial(
@@ -378,11 +541,36 @@ class PPOActor:
                         use_decoupled_loss=self.config.use_decoupled_loss,
                     ),
                     loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
+                    **train_batch_kwargs,
                 )
                 grad_cos_sim = train_stat.pop("grad_cos_sim", None)
                 if grad_cos_sim is not None and math.isfinite(float(grad_cos_sim)):
                     grad_cos_sims.append(float(grad_cos_sim))
+                if (
+                    ess_scaling is not None
+                    and ess_stat is not None
+                    and "lr" in train_stat
+                ):
+                    try:
+                        effective_lr = float(train_stat["lr"]) * float(
+                            train_batch_kwargs["optimizer_step_scale"]
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                    else:
+                        if math.isfinite(effective_lr):
+                            ess_lrs.append(effective_lr)
                 stats_tracker.scalar(**train_stat)
+
+            ess_summary = summarize_ess_stats(
+                ess_stats, include_lr_scale=ess_scaling is not None
+            )
+            if ess_scaling is not None and ess_lrs:
+                ess_summary["ess_lr/avg"] = sum(ess_lrs) / len(ess_lrs)
+                ess_summary["ess_lr/min"] = min(ess_lrs)
+                ess_summary["ess_lr/max"] = max(ess_lrs)
+            if ess_summary:
+                stats_tracker.scalar(**ess_summary)
 
             grad_cos_summary = _summarize_grad_cos_sims(grad_cos_sims)
             if grad_cos_summary:

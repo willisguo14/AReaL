@@ -218,6 +218,8 @@ def _prepare_multimodal_forward_inputs(
 
 
 class FSDPEngine(TrainEngine):
+    supports_optimizer_step_scale = True
+
     def __init__(self, config: TrainEngineConfig):
         self.config = config
         self.optimizer_config = config.optimizer
@@ -681,7 +683,31 @@ class FSDPEngine(TrainEngine):
         assert self.optimizer is not None
         self.optimizer.zero_grad()
 
-    def optimizer_step(self):
+    def _run_optimizer_step_with_lr_scale(self, optimizer_step_scale: float) -> None:
+        assert self.optimizer is not None
+        base_lrs = [group["lr"] for group in self.optimizer.param_groups]
+        try:
+            if optimizer_step_scale != 1.0:
+                for group, base_lr in zip(self.optimizer.param_groups, base_lrs):
+                    group["lr"] = base_lr * optimizer_step_scale
+            if self.config.fsdp.per_layer_optim_step:
+                assert self._per_layer_optim_wrapper is not None
+                with trace_scope("fsdp_engine.step"):
+                    self._per_layer_optim_wrapper.step()
+            else:
+                with trace_scope("fsdp_engine.step"):
+                    self.optimizer.step()
+        finally:
+            for group, base_lr in zip(self.optimizer.param_groups, base_lrs):
+                group["lr"] = base_lr
+
+    def optimizer_step(self, optimizer_step_scale: float = 1.0):
+        if not math.isfinite(float(optimizer_step_scale)) or optimizer_step_scale < 0:
+            raise ValueError(
+                f"optimizer_step_scale must be a finite non-negative value, "
+                f"got {optimizer_step_scale}"
+            )
+
         assert self.optimizer is not None
         assert self.optimizer_config is not None
         assert self.lr_scheduler is not None
@@ -697,14 +723,8 @@ class FSDPEngine(TrainEngine):
         if not math.isfinite(grad_norm):
             self.optimizer_zero_grad()
             update_successful = False
-        elif self.config.fsdp.per_layer_optim_step:
-            assert self._per_layer_optim_wrapper is not None
-            with trace_scope("fsdp_engine.step"):
-                self._per_layer_optim_wrapper.step()
-            update_successful = True
         else:
-            with trace_scope("fsdp_engine.step"):
-                self.optimizer.step()
+            self._run_optimizer_step_with_lr_scale(optimizer_step_scale)
             update_successful = True
 
         current_lr = self.lr_scheduler.get_last_lr()[0]
@@ -764,6 +784,7 @@ class FSDPEngine(TrainEngine):
         input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        optimizer_step_scale: float = 1.0,
     ) -> dict[str, float]:
         self._ensure_ready()
         self.optimizer_zero_grad()
@@ -803,7 +824,10 @@ class FSDPEngine(TrainEngine):
         )
 
         # Step 5: Optimizer step
-        stats = self.optimizer_step()
+        if optimizer_step_scale == 1.0:
+            stats = self.optimizer_step()
+        else:
+            stats = self.optimizer_step(optimizer_step_scale=optimizer_step_scale)
         grad_cos_sim = self.grad_cosine_tracker.finalize(
             grad_cosine_pending,
             update_successful=stats.get("update_successful", 0.0) == 1.0,

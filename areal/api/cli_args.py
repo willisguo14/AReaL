@@ -1439,6 +1439,37 @@ class RejectionSamplingConfig:
 
 
 @dataclass
+class ESSScalingConfig:
+    base_ess_ratio: float = field(
+        default=1.0,
+        metadata={"help": "Reference ESS ratio for VCPO ESS learning-rate scaling."},
+    )
+    min_lr_scale: float = field(
+        default=0.0,
+        metadata={"help": "Minimum optimizer-step LR multiplier from ESS scaling."},
+    )
+    max_lr_scale: float = field(
+        default=1.0,
+        metadata={"help": "Maximum optimizer-step LR multiplier from ESS scaling."},
+    )
+
+    def __post_init__(self):
+        if self.base_ess_ratio <= 0:
+            raise ValueError(
+                f"base_ess_ratio must be positive, got {self.base_ess_ratio}"
+            )
+        if self.min_lr_scale < 0:
+            raise ValueError(
+                f"min_lr_scale must be non-negative, got {self.min_lr_scale}"
+            )
+        if self.min_lr_scale > self.max_lr_scale:
+            raise ValueError(
+                f"min_lr_scale ({self.min_lr_scale}) cannot be greater than "
+                f"max_lr_scale ({self.max_lr_scale})"
+            )
+
+
+@dataclass
 class PPOActorConfig(TrainEngineConfig):
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
 
@@ -1549,6 +1580,12 @@ class PPOActorConfig(TrainEngineConfig):
             "Only effective when use_decoupled_loss=True."
         },
     )
+    ess_scaling: ESSScalingConfig | None = field(
+        default=None,
+        metadata={
+            "help": "VCPO sequence-ESS optimizer-step LR scaling. None disables scaling."
+        },
+    )
     importance_sampling_level: str = field(
         default="token",
         metadata={
@@ -1599,6 +1636,20 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        if self.ess_scaling is not None:
+            from areal.utils.constants import ProxLogpMethod
+
+            if not self.use_decoupled_loss:
+                raise ValueError(
+                    "ess_scaling requires use_decoupled_loss=True. "
+                    "Set use_decoupled_loss=True to enable ESS scaling."
+                )
+            if ProxLogpMethod(self.prox_logp_method).skips_forward_pass():
+                raise ValueError(
+                    "ess_scaling requires prox_logp_method to compute proximal "
+                    "log-probabilities with a forward pass."
+                )
+
         # Warn if rejection_sampling is configured but use_decoupled_loss is False
         if not self.use_decoupled_loss and self.rejection_sampling is not None:
             logger.warning(

@@ -30,6 +30,8 @@ if TYPE_CHECKING:
 
 
 class TrainEngine(abc.ABC):
+    supports_optimizer_step_scale = False
+
     @abc.abstractmethod
     def create_process_group(self, parallel_strategy: ParallelStrategy | None = None):
         """Initialize PyTorch distributed communication groups.
