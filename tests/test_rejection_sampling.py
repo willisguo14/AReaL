@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from areal.api.cli_args import RejectionSamplingConfig
+from areal.infra.rpc.serialization import deserialize_value, serialize_value
 from areal.utils.functional import apply_rejection_sampling
 
 
@@ -39,6 +40,26 @@ class TestRejectionSamplingConfig:
         """action='clamp' without explicit lower should default to 0.0."""
         config = RejectionSamplingConfig(action="clamp", metric="ratio", upper=5.0)
         assert config.lower == 0.0
+
+    def test_clamp_accepts_explicit_zero_lower(self):
+        """action='clamp' reconstructs with lower=0.0 after normalization."""
+        config = RejectionSamplingConfig(
+            action="clamp",
+            metric="ratio",
+            upper=5.0,
+            lower=0.0,
+        )
+
+        assert config.lower == 0.0
+
+    def test_clamp_round_trips_through_rpc_serialization(self):
+        """Worker RPC config reconstruction should preserve clamp config type."""
+        config = RejectionSamplingConfig(action="clamp", metric="ratio", upper=5.0)
+
+        round_tripped = deserialize_value(serialize_value(config))
+
+        assert isinstance(round_tripped, RejectionSamplingConfig)
+        assert round_tripped.lower == 0.0
 
 
 class TestRejectionSamplingMask:

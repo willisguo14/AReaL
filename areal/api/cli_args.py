@@ -1364,7 +1364,8 @@ class RejectionSamplingConfig:
             "help": "Lower bound for filtering (optional). "
             "None means no lower bound. "
             "For 'ratio' metric: typical value is 0.5 (filter out tokens where policy "
-            "probability dropped significantly). Must be > 0. "
+            "probability dropped significantly). Must be > 0 for mask mode; "
+            "clamp mode permits 0.0 to preserve one-sided truncation. "
             "For 'kl_k1' metric: can be used to filter negative KL estimates."
         },
     )
@@ -1394,6 +1395,19 @@ class RejectionSamplingConfig:
         if self.agg not in _VALID_AGGS:
             raise ValueError(f"agg must be one of {_VALID_AGGS}, got '{self.agg}'")
 
+        # Clamp action only supports ratio metric (direct importance weight truncation).
+        if self.action == "clamp" and self.metric != "ratio":
+            raise ValueError(
+                f"action='clamp' only supports metric='ratio' (direct importance weight "
+                f"truncation). Got metric='{self.metric}'. "
+                f"Use action='mask' for KL-based filtering."
+            )
+
+        # Clamp defaults to one-sided truncation. This must be idempotent because
+        # configs are serialized and reconstructed in worker processes.
+        if self.action == "clamp" and self.lower is None:
+            self.lower = 0.0
+
         # Validate lower <= upper when both are set.
         if self.lower is not None and self.lower > self.upper:
             raise ValueError(
@@ -1407,7 +1421,12 @@ class RejectionSamplingConfig:
                     f"upper must be > 1.0 for 'ratio' metric (otherwise all non-identical "
                     f"policy tokens will be filtered), got {self.upper}"
                 )
-            if self.lower is not None and self.lower <= 0:
+            if self.lower is not None and self.action == "clamp" and self.lower < 0:
+                raise ValueError(
+                    f"lower must be nonnegative for action='clamp' and "
+                    f"'ratio' metric, got {self.lower}"
+                )
+            if self.lower is not None and self.action != "clamp" and self.lower <= 0:
                 raise ValueError(
                     f"lower must be positive for 'ratio' metric, got {self.lower}"
                 )
@@ -1418,16 +1437,6 @@ class RejectionSamplingConfig:
             raise ValueError(
                 f"upper must be positive for '{self.metric}' metric, got {self.upper}"
             )
-        # Clamp action only supports ratio metric (direct importance weight truncation).
-        if self.action == "clamp" and self.metric != "ratio":
-            raise ValueError(
-                f"action='clamp' only supports metric='ratio' (direct importance weight "
-                f"truncation). Got metric='{self.metric}'. "
-                f"Use action='mask' for KL-based filtering."
-            )
-        # Clamp action defaults lower to 0.0 (consistent with old truncate behavior).
-        if self.action == "clamp" and self.lower is None:
-            self.lower = 0.0
         # Validate sequence-level aggregation.
         if self.level == "token" and self.agg != "mean":
             warnings.warn(
