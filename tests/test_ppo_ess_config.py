@@ -7,9 +7,21 @@ from areal.utils.constants import PROX_LOGP_METHOD_LOGLINEAR
 def test_ess_scaling_config_defaults():
     config = ESSScalingConfig()
 
+    assert config.level == "sequence"
     assert config.base_ess_ratio == 1.0
     assert config.min_lr_scale == 0.0
     assert config.max_lr_scale == 1.0
+
+
+def test_ess_scaling_config_accepts_token_level():
+    config = ESSScalingConfig(level="token")
+
+    assert config.level == "token"
+
+
+def test_ess_scaling_config_rejects_invalid_level():
+    with pytest.raises(ValueError, match="level"):
+        ESSScalingConfig(level="episode")
 
 
 def test_ess_scaling_config_rejects_nonpositive_base_ratio():

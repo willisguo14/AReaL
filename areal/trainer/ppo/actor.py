@@ -14,7 +14,12 @@ from areal.experimental.training_service.controller.controller import (
 )
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
-from areal.trainer.ppo.ess import compute_sequence_ess, summarize_ess_stats
+from areal.trainer.ppo.ess import (
+    compute_sequence_ess,
+    compute_token_ess,
+    summarize_ess_lr_scale_stats,
+    summarize_ess_stats,
+)
 from areal.trainer.ppo.stats import infer_token_denominator
 from areal.utils import logging, stats_tracker
 from areal.utils.constants import (
@@ -498,29 +503,56 @@ class PPOActor:
             # Get current version for proximal approximation metrics
             current_version = self.engine.get_version()
             grad_cos_sims: list[float] = []
-            ess_stats = []
+            sequence_ess_stats = []
+            token_ess_stats = []
+            selected_ess_stats = []
             ess_lrs: list[float] = []
 
             for mb in mb_inputs.mbs:
-                ess_stat = None
+                sequence_ess_stat = None
+                token_ess_stat = None
+                selected_ess_stat = None
                 if should_compute_ess:
                     prox_logp, logprobs, loss_mask = _ess_tensors_on_collective_device(
                         mb, ess_collective_device
                     )
-                    ess_stat = compute_sequence_ess(
+                    sequence_ess_stat = compute_sequence_ess(
                         prox_logp=prox_logp,
                         logprobs=logprobs,
                         loss_mask=loss_mask,
                         scaling_config=ess_scaling,
                         process_group=data_parallel_group,
                     )
-                    if ess_stat is not None:
-                        ess_stats.append(ess_stat)
+                    token_ess_stat = compute_token_ess(
+                        prox_logp=prox_logp,
+                        logprobs=logprobs,
+                        loss_mask=loss_mask,
+                        scaling_config=ess_scaling,
+                        process_group=data_parallel_group,
+                    )
+                    if sequence_ess_stat is not None:
+                        sequence_ess_stats.append(sequence_ess_stat)
+                    if token_ess_stat is not None:
+                        token_ess_stats.append(token_ess_stat)
+                    if ess_scaling is not None:
+                        if ess_scaling.level == "sequence":
+                            selected_ess_stat = sequence_ess_stat
+                        elif ess_scaling.level == "token":
+                            selected_ess_stat = token_ess_stat
+                        else:
+                            raise ValueError(
+                                "ess_scaling.level must be one of 'sequence' or "
+                                f"'token'; got {ess_scaling.level!r}"
+                            )
+                        if selected_ess_stat is not None:
+                            selected_ess_stats.append(selected_ess_stat)
 
                 train_batch_kwargs = {}
                 if ess_scaling is not None:
                     train_batch_kwargs["optimizer_step_scale"] = (
-                        ess_stat.ess_lr_scale if ess_stat is not None else 1.0
+                        selected_ess_stat.ess_lr_scale
+                        if selected_ess_stat is not None
+                        else 1.0
                     )
 
                 train_stat = self.engine.train_batch(
@@ -548,7 +580,7 @@ class PPOActor:
                     grad_cos_sims.append(float(grad_cos_sim))
                 if (
                     ess_scaling is not None
-                    and ess_stat is not None
+                    and selected_ess_stat is not None
                     and "lr" in train_stat
                 ):
                     try:
@@ -562,9 +594,13 @@ class PPOActor:
                             ess_lrs.append(effective_lr)
                 stats_tracker.scalar(**train_stat)
 
-            ess_summary = summarize_ess_stats(
-                ess_stats, include_lr_scale=ess_scaling is not None
+            ess_summary = {}
+            ess_summary.update(
+                summarize_ess_stats(sequence_ess_stats, level="sequence")
             )
+            ess_summary.update(summarize_ess_stats(token_ess_stats, level="token"))
+            if ess_scaling is not None:
+                ess_summary.update(summarize_ess_lr_scale_stats(selected_ess_stats))
             if ess_scaling is not None and ess_lrs:
                 ess_summary["ess_lr/avg"] = sum(ess_lrs) / len(ess_lrs)
                 ess_summary["ess_lr/min"] = min(ess_lrs)

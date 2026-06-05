@@ -42,7 +42,7 @@ def main() -> None:
 
         assert stats is not None
         expected_ess = (101.0**2) / (100.0**2 + 1.0)
-        assert stats.valid_sequence_count == 2
+        assert stats.valid_count == 2
         torch.testing.assert_close(stats.ess, expected_ess)
         torch.testing.assert_close(stats.ess_ratio, expected_ess / 2.0)
     finally:

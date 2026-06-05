@@ -1449,6 +1449,13 @@ class RejectionSamplingConfig:
 
 @dataclass
 class ESSScalingConfig:
+    level: str = field(
+        default="sequence",
+        metadata={
+            "help": "ESS level used for VCPO ESS learning-rate scaling. Options: 'sequence', 'token'.",
+            "choices": ["sequence", "token"],
+        },
+    )
     base_ess_ratio: float = field(
         default=1.0,
         metadata={"help": "Reference ESS ratio for VCPO ESS learning-rate scaling."},
@@ -1463,6 +1470,10 @@ class ESSScalingConfig:
     )
 
     def __post_init__(self):
+        if self.level not in ("sequence", "token"):
+            raise ValueError(
+                f"level must be one of ('sequence', 'token'), got {self.level!r}"
+            )
         if self.base_ess_ratio <= 0:
             raise ValueError(
                 f"base_ess_ratio must be positive, got {self.base_ess_ratio}"

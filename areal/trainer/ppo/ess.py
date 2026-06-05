@@ -15,7 +15,7 @@ class ESSStats:
     ess: float
     ess_ratio: float
     ess_lr_scale: float
-    valid_sequence_count: int
+    valid_count: int
 
 
 def _should_all_reduce(process_group: Any) -> bool:
@@ -73,8 +73,14 @@ def _validate_ess_tensor_shapes(
         )
 
 
-def compute_sequence_ess(
+def _validate_ess_level(level: str) -> None:
+    if level not in {"sequence", "token"}:
+        raise ValueError(f"level must be one of 'sequence' or 'token'; got {level!r}")
+
+
+def _compute_ess(
     *,
+    level: str,
     prox_logp: torch.Tensor,
     logprobs: torch.Tensor,
     loss_mask: torch.Tensor,
@@ -82,6 +88,7 @@ def compute_sequence_ess(
     process_group: Any | None = None,
 ) -> ESSStats | None:
     _validate_ess_tensor_shapes(prox_logp, logprobs, loss_mask)
+    _validate_ess_level(level)
 
     loss_mask = loss_mask.bool()
     token_log_ratio = prox_logp.float() - logprobs.float()
@@ -92,21 +99,23 @@ def compute_sequence_ess(
     )
     token_log_ratio = token_log_ratio.masked_fill(~loss_mask, 0.0)
 
-    valid_sequence_mask = loss_mask.any(dim=-1)
-    local_count = valid_sequence_mask.to(dtype=torch.float64).sum()
-    has_valid_sequences = bool(valid_sequence_mask.any().item())
-
-    if has_valid_sequences:
-        sequence_log_weights = token_log_ratio.sum(dim=-1)[valid_sequence_mask].to(
-            dtype=torch.float64
-        )
-        local_max = sequence_log_weights.max()
+    if level == "sequence":
+        valid_item_mask = loss_mask.any(dim=-1)
+        log_weights = token_log_ratio.sum(dim=-1)[valid_item_mask]
     else:
-        sequence_log_weights = torch.empty(
-            (0,), dtype=torch.float64, device=token_log_ratio.device
-        )
+        valid_item_mask = loss_mask
+        log_weights = token_log_ratio[valid_item_mask]
+
+    local_count = valid_item_mask.to(dtype=torch.float64).sum()
+    has_valid_items = bool(valid_item_mask.any().item())
+
+    if has_valid_items:
+        log_weights = log_weights.to(dtype=torch.float64)
+        local_max = log_weights.max()
+    else:
+        log_weights = torch.empty((0,), dtype=torch.float64, device=prox_logp.device)
         local_max = torch.tensor(
-            float("-inf"), dtype=torch.float64, device=token_log_ratio.device
+            float("-inf"), dtype=torch.float64, device=prox_logp.device
         )
 
     global_max = local_max.clone()
@@ -118,28 +127,24 @@ def compute_sequence_ess(
     if should_all_reduce:
         dist.all_reduce(global_count, op=dist.ReduceOp.SUM, group=process_group)
 
-    valid_sequence_count = int(global_count.item())
-    if valid_sequence_count == 0:
+    valid_count = int(global_count.item())
+    if valid_count == 0:
         return None
 
-    if has_valid_sequences:
-        shifted = torch.exp(sequence_log_weights - global_max)
+    if has_valid_items:
+        shifted = torch.exp(log_weights - global_max)
         shifted_sum = shifted.sum(dtype=torch.float64)
         shifted_sq_sum = (shifted * shifted).sum(dtype=torch.float64)
     else:
-        shifted_sum = torch.tensor(
-            0.0, dtype=torch.float64, device=token_log_ratio.device
-        )
-        shifted_sq_sum = torch.tensor(
-            0.0, dtype=torch.float64, device=token_log_ratio.device
-        )
+        shifted_sum = torch.tensor(0.0, dtype=torch.float64, device=prox_logp.device)
+        shifted_sq_sum = torch.tensor(0.0, dtype=torch.float64, device=prox_logp.device)
 
     if should_all_reduce:
         dist.all_reduce(shifted_sum, op=dist.ReduceOp.SUM, group=process_group)
         dist.all_reduce(shifted_sq_sum, op=dist.ReduceOp.SUM, group=process_group)
 
     ess = float((shifted_sum.square() / shifted_sq_sum).item())
-    ess_ratio = ess / valid_sequence_count
+    ess_ratio = ess / valid_count
 
     base_ess_ratio, min_lr_scale, max_lr_scale = _get_scaling_values(scaling_config)
     ess_lr_scale = math.sqrt(max(ess_ratio / base_ess_ratio, 0.0))
@@ -149,30 +154,77 @@ def compute_sequence_ess(
         ess=ess,
         ess_ratio=ess_ratio,
         ess_lr_scale=float(ess_lr_scale),
-        valid_sequence_count=valid_sequence_count,
+        valid_count=valid_count,
     )
 
 
-def summarize_ess_stats(
-    stats: list[ESSStats], include_lr_scale: bool
-) -> dict[str, float]:
+def compute_sequence_ess(
+    *,
+    prox_logp: torch.Tensor,
+    logprobs: torch.Tensor,
+    loss_mask: torch.Tensor,
+    scaling_config: Any | None = None,
+    process_group: Any | None = None,
+) -> ESSStats | None:
+    return _compute_ess(
+        level="sequence",
+        prox_logp=prox_logp,
+        logprobs=logprobs,
+        loss_mask=loss_mask,
+        scaling_config=scaling_config,
+        process_group=process_group,
+    )
+
+
+def compute_token_ess(
+    *,
+    prox_logp: torch.Tensor,
+    logprobs: torch.Tensor,
+    loss_mask: torch.Tensor,
+    scaling_config: Any | None = None,
+    process_group: Any | None = None,
+) -> ESSStats | None:
+    return _compute_ess(
+        level="token",
+        prox_logp=prox_logp,
+        logprobs=logprobs,
+        loss_mask=loss_mask,
+        scaling_config=scaling_config,
+        process_group=process_group,
+    )
+
+
+def _add_finite_summary(
+    summary: dict[str, float], name: str, values: list[float]
+) -> None:
+    finite_values = [float(value) for value in values if math.isfinite(value)]
+    if not finite_values:
+        return
+
+    summary[f"{name}/avg"] = float(sum(finite_values) / len(finite_values))
+    summary[f"{name}/min"] = float(min(finite_values))
+    summary[f"{name}/max"] = float(max(finite_values))
+
+
+def summarize_ess_stats(stats: list[ESSStats], *, level: str) -> dict[str, float]:
+    _validate_ess_level(level)
     if not stats:
         return {}
 
     summary: dict[str, float] = {}
+    _add_finite_summary(
+        summary, f"ess_ratio_{level}", [stat.ess_ratio for stat in stats]
+    )
+    _add_finite_summary(summary, f"ess_{level}", [stat.ess for stat in stats])
 
-    def add_summary(name: str, values: list[float]) -> None:
-        finite_values = [float(value) for value in values if math.isfinite(value)]
-        if not finite_values:
-            return
+    return summary
 
-        summary[f"{name}/avg"] = float(sum(finite_values) / len(finite_values))
-        summary[f"{name}/min"] = float(min(finite_values))
-        summary[f"{name}/max"] = float(max(finite_values))
 
-    add_summary("ess_ratio", [stat.ess_ratio for stat in stats])
-    add_summary("ess", [stat.ess for stat in stats])
-    if include_lr_scale:
-        add_summary("ess_lr_scale", [stat.ess_lr_scale for stat in stats])
+def summarize_ess_lr_scale_stats(stats: list[ESSStats]) -> dict[str, float]:
+    if not stats:
+        return {}
+
+    summary: dict[str, float] = {}
+    _add_finite_summary(summary, "ess_lr_scale", [stat.ess_lr_scale for stat in stats])
 
     return summary

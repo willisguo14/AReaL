@@ -1036,11 +1036,12 @@ Refer to Megatron-LM documentation for details.
 
 Configuration class: ESSScalingConfig
 
-| Parameter        | Type  | Default | Description                                             |
-| ---------------- | ----- | ------- | ------------------------------------------------------- |
-| `base_ess_ratio` | float | `1.0`   | Reference ESS ratio for VCPO ESS learning-rate scaling. |
-| `min_lr_scale`   | float | `0.0`   | Minimum optimizer-step LR multiplier from ESS scaling.  |
-| `max_lr_scale`   | float | `1.0`   | Maximum optimizer-step LR multiplier from ESS scaling.  |
+| Parameter        | Type   | Default      | Description                                                                                                       |
+| ---------------- | ------ | ------------ | ----------------------------------------------------------------------------------------------------------------- |
+| `level`          | string | `"sequence"` | ESS level used for VCPO ESS learning-rate scaling. Options: 'sequence', 'token'. **Choices:** `sequence`, `token` |
+| `base_ess_ratio` | float  | `1.0`        | Reference ESS ratio for VCPO ESS learning-rate scaling.                                                           |
+| `min_lr_scale`   | float  | `0.0`        | Minimum optimizer-step LR multiplier from ESS scaling.                                                            |
+| `max_lr_scale`   | float  | `1.0`        | Maximum optimizer-step LR multiplier from ESS scaling.                                                            |
 
 (section-fp8-engine)=
 

@@ -10,7 +10,13 @@ import torch
 from areal.api.cli_args import ESSScalingConfig
 from areal.trainer.ppo import actor as actor_module
 from areal.trainer.ppo.actor import PPOActor
-from areal.trainer.ppo.ess import ESSStats, compute_sequence_ess, summarize_ess_stats
+from areal.trainer.ppo.ess import (
+    ESSStats,
+    compute_sequence_ess,
+    compute_token_ess,
+    summarize_ess_lr_scale_stats,
+    summarize_ess_stats,
+)
 
 
 def test_compute_sequence_ess_uniform_weights():
@@ -28,7 +34,25 @@ def test_compute_sequence_ess_uniform_weights():
     assert stats.ess == pytest.approx(2.0)
     assert stats.ess_ratio == pytest.approx(1.0)
     assert stats.ess_lr_scale == pytest.approx(1.0)
-    assert stats.valid_sequence_count == 2
+    assert stats.valid_count == 2
+
+
+def test_compute_token_ess_uniform_weights():
+    logprobs = torch.tensor([[-1.0, -2.0], [-3.0, -4.0]])
+    prox_logp = logprobs.clone()
+    loss_mask = torch.ones_like(logprobs)
+
+    stats = compute_token_ess(
+        prox_logp=prox_logp,
+        logprobs=logprobs,
+        loss_mask=loss_mask,
+    )
+
+    assert stats is not None
+    assert stats.ess == pytest.approx(4.0)
+    assert stats.ess_ratio == pytest.approx(1.0)
+    assert stats.ess_lr_scale == pytest.approx(1.0)
+    assert stats.valid_count == 4
 
 
 def test_compute_sequence_ess_rejects_mismatched_tensor_shapes():
@@ -73,6 +97,61 @@ def test_compute_sequence_ess_dominant_weight_reduces_ratio():
     assert stats.ess == pytest.approx(expected_ess)
     assert stats.ess_ratio == pytest.approx(expected_ess / 2.0)
     assert stats.ess_lr_scale == pytest.approx(math.sqrt(expected_ess / 2.0))
+
+
+def test_compute_token_ess_dominant_token_reduces_ratio():
+    logprobs = torch.zeros((2, 2))
+    prox_logp = torch.tensor(
+        [
+            [math.log(100.0), 0.0],
+            [0.0, 0.0],
+        ]
+    )
+    loss_mask = torch.ones_like(logprobs)
+
+    stats = compute_token_ess(
+        prox_logp=prox_logp,
+        logprobs=logprobs,
+        loss_mask=loss_mask,
+    )
+
+    expected_ess = (103.0**2) / (100.0**2 + 1.0 + 1.0 + 1.0)
+    assert stats is not None
+    assert stats.ess == pytest.approx(expected_ess)
+    assert stats.ess_ratio == pytest.approx(expected_ess / 4.0)
+    assert stats.ess_lr_scale == pytest.approx(math.sqrt(expected_ess / 4.0))
+
+
+def test_sequence_and_token_ess_can_differ():
+    logprobs = torch.zeros((2, 2))
+    prox_logp = torch.tensor(
+        [
+            [math.log(3.0), math.log(3.0)],
+            [0.0, 0.0],
+        ]
+    )
+    loss_mask = torch.ones_like(logprobs)
+
+    sequence_stats = compute_sequence_ess(
+        prox_logp=prox_logp,
+        logprobs=logprobs,
+        loss_mask=loss_mask,
+    )
+    token_stats = compute_token_ess(
+        prox_logp=prox_logp,
+        logprobs=logprobs,
+        loss_mask=loss_mask,
+    )
+
+    assert sequence_stats is not None
+    assert token_stats is not None
+    assert sequence_stats.ess_ratio == pytest.approx(
+        ((9.0 + 1.0) ** 2 / (9.0**2 + 1.0)) / 2.0
+    )
+    assert token_stats.ess_ratio == pytest.approx(
+        ((3.0 + 3.0 + 1.0 + 1.0) ** 2 / (3.0**2 + 3.0**2 + 1.0 + 1.0)) / 4.0
+    )
+    assert sequence_stats.ess_ratio != pytest.approx(token_stats.ess_ratio)
 
 
 def test_compute_sequence_ess_applies_custom_config_lr_scale_clamps():
@@ -192,7 +271,7 @@ def test_compute_sequence_ess_excludes_empty_sequences():
     )
 
     assert stats is not None
-    assert stats.valid_sequence_count == 1
+    assert stats.valid_count == 1
     assert stats.ess == pytest.approx(1.0)
     assert stats.ess_ratio == pytest.approx(1.0)
 
@@ -228,31 +307,51 @@ def test_compute_sequence_ess_sanitizes_nonfinite_token_ratios():
     assert math.isfinite(stats.ess_lr_scale)
 
 
-def test_summarize_ess_stats_returns_avg_min_max():
+def test_summarize_ess_stats_returns_level_named_avg_min_max():
     stats = [
-        ESSStats(ess=1.0, ess_ratio=0.5, ess_lr_scale=0.25, valid_sequence_count=2),
-        ESSStats(ess=3.0, ess_ratio=0.75, ess_lr_scale=0.5, valid_sequence_count=4),
+        ESSStats(
+            ess=1.0,
+            ess_ratio=0.5,
+            ess_lr_scale=0.25,
+            valid_count=2,
+        ),
+        ESSStats(
+            ess=3.0,
+            ess_ratio=0.75,
+            ess_lr_scale=0.5,
+            valid_count=4,
+        ),
     ]
 
-    summary = summarize_ess_stats(stats, include_lr_scale=False)
+    summary = summarize_ess_stats(stats, level="sequence")
 
     assert summary == {
-        "ess_ratio/avg": pytest.approx(0.625),
-        "ess_ratio/min": pytest.approx(0.5),
-        "ess_ratio/max": pytest.approx(0.75),
-        "ess/avg": pytest.approx(2.0),
-        "ess/min": pytest.approx(1.0),
-        "ess/max": pytest.approx(3.0),
+        "ess_ratio_sequence/avg": pytest.approx(0.625),
+        "ess_ratio_sequence/min": pytest.approx(0.5),
+        "ess_ratio_sequence/max": pytest.approx(0.75),
+        "ess_sequence/avg": pytest.approx(2.0),
+        "ess_sequence/min": pytest.approx(1.0),
+        "ess_sequence/max": pytest.approx(3.0),
     }
 
 
-def test_summarize_ess_stats_includes_lr_scale_when_requested():
+def test_summarize_ess_lr_scale_stats_returns_avg_min_max():
     stats = [
-        ESSStats(ess=1.0, ess_ratio=0.5, ess_lr_scale=0.25, valid_sequence_count=2),
-        ESSStats(ess=3.0, ess_ratio=0.75, ess_lr_scale=0.5, valid_sequence_count=4),
+        ESSStats(
+            ess=1.0,
+            ess_ratio=0.5,
+            ess_lr_scale=0.25,
+            valid_count=2,
+        ),
+        ESSStats(
+            ess=3.0,
+            ess_ratio=0.75,
+            ess_lr_scale=0.5,
+            valid_count=4,
+        ),
     ]
 
-    summary = summarize_ess_stats(stats, include_lr_scale=True)
+    summary = summarize_ess_lr_scale_stats(stats)
 
     assert summary["ess_lr_scale/avg"] == pytest.approx(0.375)
     assert summary["ess_lr_scale/min"] == pytest.approx(0.25)
@@ -382,6 +481,17 @@ def _skewed_minibatch() -> dict[str, torch.Tensor]:
     return _make_minibatch(prox_logp=torch.tensor([[math.log(3.0)], [math.log(1.0)]]))
 
 
+def _multi_token_skewed_minibatch() -> dict[str, torch.Tensor]:
+    return _make_minibatch(
+        prox_logp=torch.tensor(
+            [
+                [math.log(3.0), math.log(3.0)],
+                [0.0, 0.0],
+            ]
+        )
+    )
+
+
 def _empty_minibatch() -> dict[str, torch.Tensor]:
     return _make_minibatch(
         prox_logp=torch.zeros(2, 1),
@@ -453,9 +563,9 @@ def test_ess_collective_device_uses_cpu_for_gloo_backend(monkeypatch):
     assert device == torch.device("cpu")
 
 
-def test_ppo_update_logs_ess_metrics_without_scaling(monkeypatch):
+def test_ppo_update_logs_sequence_and_token_ess_metrics_without_scaling(monkeypatch):
     recorder = _StatsRecorder()
-    minibatches = [_uniform_minibatch()]
+    minibatches = [_multi_token_skewed_minibatch()]
     _patch_actor_update_fakes(monkeypatch, recorder, minibatches)
     actor = _make_actor([{"loss": 1.0}], ess_scaling=None)
 
@@ -465,23 +575,43 @@ def test_ppo_update_logs_ess_metrics_without_scaling(monkeypatch):
         "optimizer_step_scale" not in kwargs
         for kwargs in actor.engine.train_batch_kwargs
     )
-    summary = _scalar_call_with(recorder, "ess_ratio/avg")
+    summary = _scalar_call_with(recorder, "ess_ratio_sequence/avg")
     assert {
-        "ess_ratio/avg",
-        "ess_ratio/min",
-        "ess_ratio/max",
-        "ess/avg",
-        "ess/min",
-        "ess/max",
+        "ess_ratio_sequence/avg",
+        "ess_ratio_sequence/min",
+        "ess_ratio_sequence/max",
+        "ess_sequence/avg",
+        "ess_sequence/min",
+        "ess_sequence/max",
+        "ess_ratio_token/avg",
+        "ess_ratio_token/min",
+        "ess_ratio_token/max",
+        "ess_token/avg",
+        "ess_token/min",
+        "ess_token/max",
     } <= set(summary)
+    sequence_ess_ratio = ((9.0 + 1.0) ** 2 / (9.0**2 + 1.0)) / 2.0
+    token_ess_ratio = (
+        ((3.0 + 3.0 + 1.0 + 1.0) ** 2) / (3.0**2 + 3.0**2 + 1.0 + 1.0)
+    ) / 4.0
+    assert summary["ess_ratio_sequence/avg"] == pytest.approx(sequence_ess_ratio)
+    assert summary["ess_ratio_token/avg"] == pytest.approx(token_ess_ratio)
+    assert summary["ess_ratio_sequence/avg"] != pytest.approx(
+        summary["ess_ratio_token/avg"]
+    )
+    legacy_metric_keys = {
+        "ess_ratio" + "/avg",
+        "ess" + "/avg",
+    }
+    assert legacy_metric_keys.isdisjoint(summary)
     keys = _scalar_keys(recorder)
     assert not any(key.startswith("ess_lr_scale/") for key in keys)
     assert not any(key.startswith("ess_lr/") for key in keys)
 
 
-def test_ppo_update_passes_per_minibatch_ess_scale_when_enabled(monkeypatch):
+def test_ppo_update_sequence_scaling_uses_sequence_ess_by_default(monkeypatch):
     recorder = _StatsRecorder()
-    minibatches = [_uniform_minibatch(), _skewed_minibatch()]
+    minibatches = [_uniform_minibatch(), _multi_token_skewed_minibatch()]
     _patch_actor_update_fakes(monkeypatch, recorder, minibatches)
     actor = _make_actor(
         [{"loss": 1.0}, {"loss": 2.0}],
@@ -490,15 +620,36 @@ def test_ppo_update_passes_per_minibatch_ess_scale_when_enabled(monkeypatch):
 
     actor._ppo_update(_make_data())
 
+    sequence_ess_ratio = ((9.0 + 1.0) ** 2 / (9.0**2 + 1.0)) / 2.0
     scales = [
         kwargs["optimizer_step_scale"] for kwargs in actor.engine.train_batch_kwargs
     ]
-    assert scales == pytest.approx([1.0, math.sqrt(0.8)])
+    assert scales == pytest.approx([1.0, math.sqrt(sequence_ess_ratio)])
+
+
+def test_ppo_update_token_scaling_uses_token_ess(monkeypatch):
+    recorder = _StatsRecorder()
+    minibatches = [_uniform_minibatch(), _multi_token_skewed_minibatch()]
+    _patch_actor_update_fakes(monkeypatch, recorder, minibatches)
+    actor = _make_actor(
+        [{"loss": 1.0}, {"loss": 2.0}],
+        ess_scaling=ESSScalingConfig(level="token"),
+    )
+
+    actor._ppo_update(_make_data())
+
+    token_ess_ratio = (
+        ((3.0 + 3.0 + 1.0 + 1.0) ** 2) / (3.0**2 + 3.0**2 + 1.0 + 1.0)
+    ) / 4.0
+    scales = [
+        kwargs["optimizer_step_scale"] for kwargs in actor.engine.train_batch_kwargs
+    ]
+    assert scales == pytest.approx([1.0, math.sqrt(token_ess_ratio)])
 
 
 def test_ppo_update_logs_effective_lr_when_scaling_enabled(monkeypatch):
     recorder = _StatsRecorder()
-    minibatches = [_uniform_minibatch(), _skewed_minibatch()]
+    minibatches = [_uniform_minibatch(), _multi_token_skewed_minibatch()]
     _patch_actor_update_fakes(monkeypatch, recorder, minibatches)
     actor = _make_actor(
         [{"loss": 1.0, "lr": 0.01}, {"loss": 2.0, "lr": 0.01}],
@@ -507,7 +658,8 @@ def test_ppo_update_logs_effective_lr_when_scaling_enabled(monkeypatch):
 
     actor._ppo_update(_make_data())
 
-    scale_2 = math.sqrt(0.8)
+    sequence_ess_ratio = ((9.0 + 1.0) ** 2 / (9.0**2 + 1.0)) / 2.0
+    scale_2 = math.sqrt(sequence_ess_ratio)
     summary = _scalar_call_with(recorder, "ess_lr_scale/avg")
     assert summary["ess_lr_scale/avg"] == pytest.approx((1.0 + scale_2) / 2)
     assert summary["ess_lr_scale/min"] == pytest.approx(scale_2)
@@ -623,13 +775,22 @@ def test_ppo_update_uses_scale_one_for_empty_ess_minibatch(monkeypatch):
         kwargs["optimizer_step_scale"] for kwargs in actor.engine.train_batch_kwargs
     ]
     assert scales == pytest.approx([1.0, math.sqrt(0.8)])
-    summary = _scalar_call_with(recorder, "ess_ratio/avg")
-    assert summary["ess_ratio/avg"] == pytest.approx(0.8)
-    assert summary["ess_ratio/min"] == pytest.approx(0.8)
-    assert summary["ess_ratio/max"] == pytest.approx(0.8)
-    assert summary["ess/avg"] == pytest.approx(1.6)
-    assert summary["ess/min"] == pytest.approx(1.6)
-    assert summary["ess/max"] == pytest.approx(1.6)
+    summary = _scalar_call_with(recorder, "ess_ratio_sequence/avg")
+    assert summary["ess_ratio_sequence/avg"] == pytest.approx(0.8)
+    assert summary["ess_ratio_sequence/min"] == pytest.approx(0.8)
+    assert summary["ess_ratio_sequence/max"] == pytest.approx(0.8)
+    assert summary["ess_sequence/avg"] == pytest.approx(1.6)
+    assert summary["ess_sequence/min"] == pytest.approx(1.6)
+    assert summary["ess_sequence/max"] == pytest.approx(1.6)
+    assert summary["ess_ratio_token/avg"] == pytest.approx(0.8)
+    assert summary["ess_ratio_token/min"] == pytest.approx(0.8)
+    assert summary["ess_ratio_token/max"] == pytest.approx(0.8)
+    assert summary["ess_token/avg"] == pytest.approx(1.6)
+    assert summary["ess_token/min"] == pytest.approx(1.6)
+    assert summary["ess_token/max"] == pytest.approx(1.6)
+    assert summary["ess_lr_scale/avg"] == pytest.approx(math.sqrt(0.8))
+    assert summary["ess_lr_scale/min"] == pytest.approx(math.sqrt(0.8))
+    assert summary["ess_lr_scale/max"] == pytest.approx(math.sqrt(0.8))
     assert summary["ess_lr/avg"] == pytest.approx(0.01 * math.sqrt(0.8))
     assert summary["ess_lr/min"] == pytest.approx(0.01 * math.sqrt(0.8))
     assert summary["ess_lr/max"] == pytest.approx(0.01 * math.sqrt(0.8))
@@ -651,6 +812,9 @@ def test_ppo_update_omits_ess_summary_when_all_ess_minibatches_empty(monkeypatch
     ]
     assert scales == pytest.approx([1.0, 1.0])
     keys = _scalar_keys(recorder)
-    assert not any(key.startswith("ess_ratio/") for key in keys)
+    assert not any(key.startswith("ess_ratio_sequence/") for key in keys)
+    assert not any(key.startswith("ess_sequence/") for key in keys)
+    assert not any(key.startswith("ess_ratio_token/") for key in keys)
+    assert not any(key.startswith("ess_token/") for key in keys)
     assert not any(key.startswith("ess_lr_scale/") for key in keys)
     assert not any(key.startswith("ess_lr/") for key in keys)
