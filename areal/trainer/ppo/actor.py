@@ -48,6 +48,74 @@ from areal.utils.perf_tracer import trace_perf
 logger = logging.getLogger("PPOActor")
 
 
+_PER_TRAJECTORY_BATCH_LIST_METADATA_KEYS = frozenset(
+    {"ids", "traj_uid", "uid", "rid", "task_id"}
+)
+_PER_TRAJECTORY_BATCH_TENSOR_METADATA_KEYS = frozenset(
+    {
+        "begin_of_trajectory",
+        "rid",
+        "task_id",
+        "task_reward",
+        "trainer_global_step",
+        "traj_uid",
+        "uid",
+        "versions",
+    }
+)
+
+
+def _insert_per_trajectory_minibatch_metadata(
+    data: dict[str, Any],
+    mb_inputs: Any,
+) -> None:
+    batch_size = int(data["attention_mask"].shape[0])
+    forward_indices_raw = getattr(mb_inputs, "forward_indices", None)
+    if forward_indices_raw is None:
+        raise RuntimeError(
+            "actor.per_trajectory requires minibatch forward_indices metadata."
+        )
+    forward_indices = list(forward_indices_raw)
+    if len(forward_indices) != batch_size:
+        raise RuntimeError(
+            "actor.per_trajectory minibatch forward_indices must match batch size."
+        )
+
+    ordered_metadata: dict[str, Any] = {}
+    for key, value in data.items():
+        if isinstance(value, torch.Tensor):
+            if (
+                key not in _PER_TRAJECTORY_BATCH_TENSOR_METADATA_KEYS
+                or value.ndim == 0
+                or int(value.shape[0]) != batch_size
+            ):
+                continue
+            index = torch.as_tensor(
+                forward_indices,
+                dtype=torch.long,
+                device=value.device,
+            )
+            ordered_metadata[key] = value.index_select(0, index)
+        elif (
+            isinstance(value, list)
+            and key in _PER_TRAJECTORY_BATCH_LIST_METADATA_KEYS
+            and len(value) == batch_size
+        ):
+            ordered_metadata[key] = [value[index] for index in forward_indices]
+
+    offset = 0
+    for mb in mb_inputs.mbs:
+        mb_size = int(mb["attention_mask"].shape[0])
+        for key, ordered_value in ordered_metadata.items():
+            mb[key] = ordered_value[offset : offset + mb_size]
+        offset += mb_size
+
+    if offset != batch_size:
+        raise RuntimeError(
+            "actor.per_trajectory minibatch sequence counts must match batch size."
+        )
+
+
 def _summarize_grad_cos_sims(values: list[float]) -> dict[str, float]:
     finite_values = [float(value) for value in values if math.isfinite(float(value))]
     if not finite_values:
@@ -282,6 +350,9 @@ class PPOActor:
         )
 
         # Reward Penalty on length
+        if self.config.per_trajectory.enabled and "task_reward" not in data:
+            data["task_reward"] = data["rewards"].detach().clone()
+
         if self.config.overlong_reward_penalty:
             overlong_tokens = self.config.overlong_tokens
             overlong_penalty_factor = self.config.overlong_penalty_factor
@@ -488,6 +559,12 @@ class PPOActor:
             )
         ########## Logging code ends ##########
 
+        if self.config.per_trajectory.enabled:
+            task_reward = data.get("task_reward", reward_score)
+            if isinstance(task_reward, torch.Tensor):
+                task_reward = task_reward.detach().clone()
+            data["task_reward"] = task_reward
+
         # Pop keys that are no longer needed after advantage computation
         # Note: "versions" is kept if needed for approximation/metrics in loss function
         for key in ["rewards", "tot_rewards", "kl_rewards"]:
@@ -498,6 +575,8 @@ class PPOActor:
             data,
             mb_spec=MicroBatchSpec(n_mbs=self.config.ppo_n_minibatches),
         )
+        if self.config.per_trajectory.enabled:
+            _insert_per_trajectory_minibatch_metadata(data, mb_inputs)
 
         with stats_tracker.scope("update"):
             # Get current version for proximal approximation metrics
@@ -508,7 +587,7 @@ class PPOActor:
             selected_ess_stats = []
             ess_lrs: list[float] = []
 
-            for mb in mb_inputs.mbs:
+            for mb_idx, mb in enumerate(mb_inputs.mbs):
                 sequence_ess_stat = None
                 token_ess_stat = None
                 selected_ess_stat = None
@@ -555,26 +634,42 @@ class PPOActor:
                         else 1.0
                     )
 
-                train_stat = self.engine.train_batch(
-                    mb,
-                    loss_fn=functools.partial(
-                        grpo_loss_fn,
-                        eps_clip=self.config.eps_clip,
-                        eps_clip_higher=self.config.eps_clip_higher,
-                        c_clip=self.config.c_clip,
-                        rejection_sampling=self.config.rejection_sampling,
-                        m2_threshold=self.m2_threshold,
-                        importance_sampling_level=self.config.importance_sampling_level,
-                        current_version=current_version,
-                        prox_logp_method=self.config.prox_logp_method,
-                        use_sapo_loss=self.config.use_sapo_loss,
-                        sapo_tau_pos=self.config.sapo_tau_pos,
-                        sapo_tau_neg=self.config.sapo_tau_neg,
-                        use_decoupled_loss=self.config.use_decoupled_loss,
-                    ),
-                    loss_weight_fn=lambda x: x["loss_mask"].count_nonzero(),
-                    **train_batch_kwargs,
+                actor_loss_fn = functools.partial(
+                    grpo_loss_fn,
+                    eps_clip=self.config.eps_clip,
+                    eps_clip_higher=self.config.eps_clip_higher,
+                    c_clip=self.config.c_clip,
+                    rejection_sampling=self.config.rejection_sampling,
+                    m2_threshold=self.m2_threshold,
+                    importance_sampling_level=self.config.importance_sampling_level,
+                    current_version=current_version,
+                    prox_logp_method=self.config.prox_logp_method,
+                    use_sapo_loss=self.config.use_sapo_loss,
+                    sapo_tau_pos=self.config.sapo_tau_pos,
+                    sapo_tau_neg=self.config.sapo_tau_neg,
+                    use_decoupled_loss=self.config.use_decoupled_loss,
                 )
+                common_kwargs = {
+                    "loss_fn": actor_loss_fn,
+                    "loss_weight_fn": lambda x: x["loss_mask"].count_nonzero(),
+                    **train_batch_kwargs,
+                }
+                if self.config.per_trajectory.enabled:
+                    train_batch_fn = getattr(
+                        self.engine, "train_batch_per_trajectory", None
+                    )
+                    if train_batch_fn is None:
+                        raise RuntimeError(
+                            "actor.per_trajectory.enabled requires a Megatron "
+                            "engine with train_batch_per_trajectory support."
+                        )
+                    train_stat = train_batch_fn(
+                        mb,
+                        minibatch_idx=mb_idx,
+                        **common_kwargs,
+                    )
+                else:
+                    train_stat = self.engine.train_batch(mb, **common_kwargs)
                 grad_cos_sim = train_stat.pop("grad_cos_sim", None)
                 if grad_cos_sim is not None and math.isfinite(float(grad_cos_sim)):
                     grad_cos_sims.append(float(grad_cos_sim))

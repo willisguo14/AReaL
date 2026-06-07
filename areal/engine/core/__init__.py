@@ -2,6 +2,18 @@
 
 """Core utilities for training engines."""
 
+from areal.engine.core.per_trajectory import (
+    LogprobSummary,
+    PerTrajectoryRecord,
+    PerTrajectoryTracer,
+    attach_trainer_step_metadata,
+    normalize_flush_threshold,
+    per_trajectory_log_dir,
+    preserve_rollout_logprobs,
+    slice_trajectory,
+    summarize_logprobs,
+    trajectory_id_from_sample,
+)
 from areal.engine.core.train_engine import (
     aggregate_eval_losses,
     compute_total_loss_weight,
@@ -11,5 +23,15 @@ from areal.engine.core.train_engine import (
 __all__ = [
     "aggregate_eval_losses",
     "compute_total_loss_weight",
+    "LogprobSummary",
+    "PerTrajectoryRecord",
+    "PerTrajectoryTracer",
+    "attach_trainer_step_metadata",
+    "normalize_flush_threshold",
+    "per_trajectory_log_dir",
+    "preserve_rollout_logprobs",
     "reorder_and_pad_outputs",
+    "slice_trajectory",
+    "summarize_logprobs",
+    "trajectory_id_from_sample",
 ]

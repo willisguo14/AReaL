@@ -48,9 +48,15 @@ from areal.api import (
 from areal.api.cli_args import MicroBatchSpec, PerfTracerConfig, TrainEngineConfig
 from areal.api.io_struct import DeviceRuntimeInfo
 from areal.engine.core import (
+    PerTrajectoryRecord,
+    PerTrajectoryTracer,
     aggregate_eval_losses,
     compute_total_loss_weight,
+    per_trajectory_log_dir,
     reorder_and_pad_outputs,
+    slice_trajectory,
+    summarize_logprobs,
+    trajectory_id_from_sample,
 )
 from areal.engine.core.distributed import (
     init_custom_process_group,
@@ -78,6 +84,16 @@ from areal.engine.megatron_utils.packed_context_parallel import (
     packed_context_parallel_forward,
     reassemble_cp_packed_logprobs,
     split_packed_seqs_for_context_parallel,
+)
+from areal.engine.megatron_utils.per_trajectory import (
+    accumulate_grad_buffers,
+    allocate_grad_accum_buffers,
+    copy_accum_buffers_to_grad_buffers,
+    disable_dp_sync,
+    finish_dp_grad_sync,
+    grad_norm_from_model_parallel_stats,
+    restore_dp_sync,
+    zero_grad_accum_buffers,
 )
 from areal.engine.megatron_utils.pipeline_parallel import (
     configure_pipeline_layer_splits,
@@ -552,6 +568,139 @@ class MegatronEngine(TrainEngine):
             self.bridge = None
         return self.bridge
 
+    def _validate_per_trajectory_supported(self) -> None:
+        if self.config.is_critic:
+            raise RuntimeError(
+                "actor.per_trajectory is actor-only and does not support critics."
+            )
+        mcore_config = getattr(self, "mcore_config", None)
+        if mcore_config is not None:
+            if getattr(mcore_config, "wrap_with_ddp", True) is False:
+                raise RuntimeError(
+                    "actor.per_trajectory requires actor.megatron.wrap_with_ddp=True "
+                    "because per-trajectory gradients are read from Megatron DDP "
+                    "wrapping."
+                )
+            if getattr(mcore_config, "use_torch_fsdp2", False):
+                raise RuntimeError(
+                    "actor.per_trajectory does not support FSDP in v0 "
+                    "(actor.megatron.use_torch_fsdp2=True)."
+                )
+            if getattr(mcore_config, "use_custom_fsdp", False):
+                raise RuntimeError(
+                    "actor.per_trajectory does not support FSDP in v0 "
+                    "(actor.megatron.use_custom_fsdp=True)."
+                )
+        if self.parallel_strategy.pipeline_parallel_size != 1:
+            raise RuntimeError(
+                "actor.per_trajectory requires pipeline_parallel_size == 1 in v0."
+            )
+        for config_name in ("parallel_strategy", "tf_config"):
+            context_parallel_size = getattr(
+                getattr(self, config_name, None),
+                "context_parallel_size",
+                1,
+            )
+            if context_parallel_size != 1:
+                raise RuntimeError(
+                    "actor.per_trajectory requires context_parallel_size == 1 in v0 "
+                    f"({config_name}.context_parallel_size={context_parallel_size})."
+                )
+        if getattr(self.parallel_strategy, "expert_parallel_size", 1) != 1:
+            raise RuntimeError(
+                "actor.per_trajectory does not support MoE/expert parallelism in v0."
+            )
+        if getattr(self.parallel_strategy, "expert_tensor_parallel_size", 1) != 1:
+            raise RuntimeError(
+                "actor.per_trajectory does not support MoE/expert tensor parallelism in v0."
+            )
+        for config_name in ("tf_config", "mcore_config"):
+            if getattr(getattr(self, config_name, None), "num_moe_experts", None):
+                raise RuntimeError(
+                    "actor.per_trajectory does not support MoE models with "
+                    f"{config_name}.num_moe_experts in v0."
+                )
+        if self.enable_tree_training:
+            raise RuntimeError(
+                "actor.per_trajectory does not support tree training in v0."
+            )
+        if self.enable_fp8:
+            raise RuntimeError("actor.per_trajectory does not support FP8 in v0.")
+        if (
+            getattr(self.config, "use_lora", False)
+            or getattr(self, "bridge_lora", None) is not None
+        ):
+            raise RuntimeError("actor.per_trajectory does not support LoRA in v0.")
+        if getattr(
+            getattr(getattr(self, "mcore_config", None), "ddp", None),
+            "overlap_grad_reduce",
+            False,
+        ):
+            raise RuntimeError(
+                "actor.per_trajectory does not support overlap_grad_reduce in v0."
+            )
+
+    def _per_trajectory_tracer_path(self, input_batched: dict[str, Any]) -> str:
+        fileroot = input_batched.get("trainer_fileroot")
+        if not isinstance(fileroot, str) or not fileroot:
+            raise RuntimeError(
+                "actor.per_trajectory requires trainer_fileroot metadata from RLTrainer."
+            )
+        base = per_trajectory_log_dir(
+            fileroot=fileroot,
+            experiment_name=self.config.experiment_name,
+            trial_name=self.config.trial_name,
+        )
+        dp_rank = int(mpu.get_data_parallel_rank())
+        tp_rank = int(mpu.get_tensor_model_parallel_rank())
+        return str(base / f"dp_{dp_rank:05d}_tp_{tp_rank:05d}.jsonl")
+
+    def _make_per_trajectory_tracer(
+        self, input_batched: dict[str, Any]
+    ) -> PerTrajectoryTracer:
+        cfg = self.config.per_trajectory
+        get_cp_rank = getattr(mpu, "get_context_parallel_rank", lambda: 0)
+        tp_rank = int(mpu.get_tensor_model_parallel_rank())
+        cp_rank = int(get_cp_rank())
+        return PerTrajectoryTracer(
+            path=self._per_trajectory_tracer_path(input_batched),
+            flush_threshold=cfg.flush_threshold,
+            enabled=cfg.enabled and tp_rank == 0 and cp_rank == 0,
+        )
+
+    @staticmethod
+    def _extract_scalar_from_batch(
+        batch: dict[str, Any],
+        key: str,
+        default: int = -1,
+    ) -> int:
+        value = batch.get(key)
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return default
+            try:
+                return int(value.detach().flatten()[0].item())
+            except (TypeError, ValueError, OverflowError):
+                return default
+        if isinstance(value, int):
+            return int(value)
+        return default
+
+    @staticmethod
+    def _reward_from_batch(batch: dict[str, Any]) -> float:
+        for key in ("rewards", "task_reward"):
+            value = batch.get(key)
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 0:
+                    continue
+                try:
+                    return float(value.detach().flatten()[0].item())
+                except (TypeError, ValueError, OverflowError):
+                    continue
+            if isinstance(value, int | float):
+                return float(value)
+        return float("nan")
+
     @property
     def initialized(self) -> bool:
         return self._initialized
@@ -975,6 +1124,175 @@ class MegatronEngine(TrainEngine):
             stats["grad_cos_sim"] = float(grad_cos_sim)
         stats["num_micro_batches"] = len(mb_list.mbs)
         return stats
+
+    def train_batch_per_trajectory(
+        self,
+        input_: list[dict[str, Any]] | dict[str, Any],
+        loss_fn: Callable[..., torch.Tensor],
+        loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        *,
+        minibatch_idx: int,
+    ) -> dict[str, float]:
+        self._ensure_ready()
+        self._validate_per_trajectory_supported()
+        self.optimizer_zero_grad()
+
+        input_batched, _ = self._normalize_batch_input(input_)
+        full_mb_list = self._prepare_mb_list(input_batched).to(self.device)
+        total_loss_weight = compute_total_loss_weight(
+            full_mb_list,
+            loss_weight_fn,
+            mpu.get_data_parallel_group(with_context_parallel=True),
+        )
+
+        accum_buffers = allocate_grad_accum_buffers(self.model)
+        zero_grad_accum_buffers(accum_buffers)
+        tracer: PerTrajectoryTracer | None = None
+        dp_sync_state: tuple[Any, Any, Any] | None = None
+
+        try:
+            tracer = self._make_per_trajectory_tracer(input_batched)
+            dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
+            dp_world_size = int(dist.get_world_size(dp_group))
+            if dp_world_size > 1:
+                dp_sync_state = disable_dp_sync(self.model)
+
+            trajectory_mb_spec = MicroBatchSpec.new(
+                self.config.mb_spec,
+                n_mbs=1,
+                n_mbs_divisor=1,
+            )
+            n_trajectories = int(input_batched["attention_mask"].shape[0])
+            for trajectory_idx in range(n_trajectories):
+                traj_batch = slice_trajectory(input_batched, trajectory_idx)
+                traj_mb_list = self._prepare_mb_list(
+                    traj_batch,
+                    mb_spec=trajectory_mb_spec,
+                ).to(self.device)
+                schedule_scale = len(traj_mb_list)
+                loss_scale_value = float(self.optimizer.get_loss_scale().item())
+                dp_loss_multiplier = float(mpu.get_data_parallel_world_size())
+                if dp_loss_multiplier <= 0.0:
+                    raise ValueError(
+                        "data_parallel_world_size must be positive for "
+                        "per-trajectory grad norm de-scaling"
+                    )
+                loss_multiplier = dp_loss_multiplier * loss_scale_value * schedule_scale
+
+                train_logprob_sum = 0.0
+                train_response_length = 0
+
+                def capture_logprobs(
+                    logprobs: torch.Tensor,
+                    captured_inputs: dict[str, Any],
+                ) -> None:
+                    nonlocal train_logprob_sum, train_response_length
+                    summary = summarize_logprobs(
+                        logprobs,
+                        captured_inputs["loss_mask"].bool(),
+                    )
+                    train_logprob_sum += summary.sum
+                    train_response_length += summary.length
+
+                def process_output(
+                    output: torch.Tensor,
+                    inputs: dict[str, Any],
+                ) -> torch.Tensor:
+                    return self._compute_logprobs_and_loss(
+                        output,
+                        inputs,
+                        loss_fn,
+                        loss_weight_fn,
+                        total_loss_weight,
+                        loss_multiplier=loss_multiplier,
+                        logprob_callback=capture_logprobs,
+                    )
+
+                self.forward_backward_batch(
+                    traj_mb_list,
+                    process_output,
+                    forward_only=False,
+                )
+                if train_response_length <= 0:
+                    raise ValueError(
+                        "per-trajectory train logprob summary was not captured"
+                    )
+
+                grad_norm = grad_norm_from_model_parallel_stats(
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    duplicated_param_names=self._duplicated_param_names,
+                    loss_scale=loss_scale_value,
+                    schedule_scale=schedule_scale,
+                )
+                trace_grad_norm = grad_norm / dp_loss_multiplier
+                accumulate_grad_buffers(self.model, accum_buffers)
+
+                rollout_summary = summarize_logprobs(
+                    traj_batch["rollout_logprobs"],
+                    traj_batch.get("rollout_loss_mask", traj_batch["loss_mask"]),
+                )
+                trainer_global_step = self._extract_scalar_from_batch(
+                    traj_batch,
+                    "trainer_global_step",
+                )
+                trajectory_id = trajectory_id_from_sample(
+                    traj_batch,
+                    fallback=(
+                        f"step-{trainer_global_step}:mb-{minibatch_idx}:"
+                        f"traj-{trajectory_idx}"
+                    ),
+                )
+                assert tracer is not None
+                tracer.write(
+                    PerTrajectoryRecord(
+                        trainer_global_step=trainer_global_step,
+                        minibatch_idx=int(minibatch_idx),
+                        trajectory_idx=trajectory_idx,
+                        trajectory_id=trajectory_id,
+                        grad_norm=float(trace_grad_norm),
+                        logprob_train_sum=float(train_logprob_sum),
+                        logprob_train_mean=float(
+                            train_logprob_sum / train_response_length
+                        ),
+                        logprob_infer_sum=rollout_summary.sum,
+                        logprob_infer_mean=rollout_summary.mean,
+                        reward=self._reward_from_batch(traj_batch),
+                        response_length=rollout_summary.length,
+                    )
+                )
+                self.optimizer_zero_grad()
+
+            copy_accum_buffers_to_grad_buffers(self.model, accum_buffers)
+            if dp_world_size > 1:
+                finish_dp_grad_sync(self.model)
+
+            grad_cosine_pending = self.grad_cosine_tracker.prepare(
+                model=self.model,
+                optimizer=self.optimizer,
+                duplicated_param_names=self._duplicated_param_names,
+                device=self.device,
+            )
+
+            stats = self.optimizer_step()
+            grad_cos_sim = self.grad_cosine_tracker.finalize(
+                grad_cosine_pending,
+                update_successful=stats.get("update_successful", 0.0) == 1.0,
+            )
+            if grad_cos_sim is not None:
+                stats["grad_cos_sim"] = float(grad_cos_sim)
+            stats["num_micro_batches"] = len(full_mb_list.mbs)
+            return stats
+        finally:
+            try:
+                if tracer is not None:
+                    tracer.close()
+            finally:
+                try:
+                    if dp_sync_state is not None:
+                        restore_dp_sync(self.model, dp_sync_state)
+                finally:
+                    self.optimizer_zero_grad()
 
     @torch.no_grad()
     def eval_batch(
@@ -1939,8 +2257,13 @@ class MegatronEngine(TrainEngine):
                 fp8_direct_convert=self.fp8_direct_convert,
             )
 
-    def _prepare_mb_list(self, input_: dict[str, Any]) -> MicroBatchList:
+    def _prepare_mb_list(
+        self,
+        input_: dict[str, Any],
+        mb_spec: MicroBatchSpec | None = None,
+    ) -> MicroBatchList:
         assert "attention_mask" in input_ and "input_ids" in input_
+        base_mb_spec = mb_spec or self.config.mb_spec
         # Parallel sizes
         pp_size = self.parallel_strategy.pipeline_parallel_size
         cp_size = self.parallel_strategy.context_parallel_size
@@ -1951,7 +2274,7 @@ class MegatronEngine(TrainEngine):
             )
             mb_list = build_packed_tree_batch(
                 input_,
-                mb_spec=self.config.mb_spec,
+                mb_spec=base_mb_spec,
                 pad_to_maximum=self.config.pad_to_maximum,
                 dp_group=self.data_parallel_group,
                 parallel_size=tp_size,
@@ -1982,8 +2305,8 @@ class MegatronEngine(TrainEngine):
         # context parallel rank, so the total number of tokens per
         # GPU in a forward pass here will be `max_tokens_per_mb / cp_size`.
         mb_spec = MicroBatchSpec.new(
-            self.config.mb_spec,
-            n_mbs=max(min_n_mbs, self.config.mb_spec.n_mbs),
+            base_mb_spec,
+            n_mbs=max(min_n_mbs, base_mb_spec.n_mbs),
             n_mbs_divisor=pp_size,
         )
         mb_list = split_padded_tensor_dict_into_mb_list(
@@ -2050,6 +2373,7 @@ class MegatronEngine(TrainEngine):
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
         total_loss_weight: torch.Tensor,
         loss_multiplier: float = 1.0,
+        logprob_callback: Callable[[torch.Tensor, dict[str, Any]], None] | None = None,
     ) -> torch.Tensor:
         local_weight = loss_weight_fn(inputs)
         if local_weight == 0:
@@ -2144,6 +2468,8 @@ class MegatronEngine(TrainEngine):
                     inputs = {
                         k: v for k, v in inputs.items() if not k.startswith("_cp_")
                     }
+            if logprob_callback is not None:
+                logprob_callback(logprobs.detach(), inputs)
             loss = loss_fn(
                 logprobs,
                 entropy,

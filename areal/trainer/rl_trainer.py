@@ -35,6 +35,10 @@ from areal.api.cli_args import (
     vLLMConfig,
 )
 from areal.engine import RemoteSGLangEngine, RemotevLLMEngine
+from areal.engine.core import (
+    attach_trainer_step_metadata,
+    preserve_rollout_logprobs,
+)
 from areal.experimental.inference_service.controller.controller import (
     RolloutControllerV2,
 )
@@ -73,6 +77,22 @@ if TYPE_CHECKING:
     from areal.trainer.ppo.critic import PPOCriticController
 
 logger = logging.getLogger("RLTrainer")
+
+
+def _maybe_attach_per_trajectory_rollout_metadata(
+    rollout_batch: list[dict[str, Any]],
+    config: PPOConfig,
+    global_step: int,
+) -> None:
+    if not config.actor.per_trajectory.enabled:
+        return
+
+    preserve_rollout_logprobs(rollout_batch)
+    attach_trainer_step_metadata(
+        rollout_batch,
+        global_step=global_step,
+        fileroot=config.cluster.fileroot,
+    )
 
 
 class _EmptyDataLoader:
@@ -653,6 +673,12 @@ class PPOTrainer:
                     for traj, logp in zip(rollout_batch, prox_logps):
                         traj["prox_logp"] = logp
                     self.actor.get_device_stats().log("recompute logp")
+
+            _maybe_attach_per_trajectory_rollout_metadata(
+                rollout_batch,
+                config,
+                global_step=global_step,
+            )
 
             with (
                 stats_tracker.record_timing("compute_advantage"),

@@ -1490,6 +1490,25 @@ class ESSScalingConfig:
 
 
 @dataclass
+class PerTrajectoryConfig:
+    """Configuration for exact per-trajectory actor gradient tracing."""
+
+    enabled: bool = field(
+        default=False,
+        metadata={"help": "Enable exact per-trajectory actor gradient tracing."},
+    )
+    flush_threshold: int = field(
+        default=256,
+        metadata={
+            "help": (
+                "Flush per-trajectory JSONL records once this many entries are "
+                "buffered. Values <= 0 fall back to 1."
+            )
+        },
+    )
+
+
+@dataclass
 class PPOActorConfig(TrainEngineConfig):
     """Configuration for PPO actor model, a subclass of a TrainEngine."""
 
@@ -1635,6 +1654,15 @@ class PPOActorConfig(TrainEngineConfig):
         default_factory=lambda: [],
         metadata={"help": "Keys for logging agent trajectory statistics"},
     )
+    per_trajectory: PerTrajectoryConfig = field(
+        default_factory=PerTrajectoryConfig,
+        metadata={
+            "help": (
+                "Exact per-trajectory actor gradient/logprob tracing. "
+                "Megatron-only in v0."
+            )
+        },
+    )
     # Others
     max_new_tokens: int = field(
         default=1024,
@@ -1656,6 +1684,28 @@ class PPOActorConfig(TrainEngineConfig):
 
     def __post_init__(self):
         """Validate PPO actor configuration."""
+        if self.per_trajectory.enabled:
+            if not self.disable_dropout:
+                raise ValueError(
+                    "actor.per_trajectory.enabled requires disable_dropout=True "
+                    "for deterministic per-trajectory gradient decomposition."
+                )
+            if self.m2_threshold is not None:
+                raise ValueError(
+                    "actor.per_trajectory.enabled does not support m2_threshold "
+                    "in v0 because M2PO masking is batch-coupled."
+                )
+            if self.ess_scaling is not None:
+                raise ValueError(
+                    "actor.per_trajectory.enabled does not support ess_scaling "
+                    "in v0 because Megatron optimizer_step_scale is unsupported."
+                )
+            if self.mb_spec.granularity != 1:
+                raise ValueError(
+                    "actor.per_trajectory.enabled requires actor.mb_spec.granularity == 1 "
+                    "so each trace record is one trajectory."
+                )
+
         if self.ess_scaling is not None:
             from areal.utils.constants import ProxLogpMethod
 

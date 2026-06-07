@@ -69,6 +69,7 @@ def _make_actor(train_stats) -> PPOActor:
         importance_sampling_level="token",
         log_agent_stats=False,
         mask_no_eos_with_zero=False,
+        per_trajectory=SimpleNamespace(enabled=False),
         ppo_n_minibatches=len(train_stats),
         prox_logp_method=None,
         rejection_sampling=None,

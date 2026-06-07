@@ -23,6 +23,10 @@ from areal.utils.seqpack import get_allocate_fn
 
 logger = logging.getLogger("DataUtils")
 
+_PER_TRAJECTORY_SCALAR_METADATA_KEYS = frozenset(
+    {"ids", "traj_uid", "uid", "rid", "task_id"}
+)
+
 
 def get_batch_size(data: dict[str, Any]) -> int:
     if not data:
@@ -292,6 +296,8 @@ def concat_padded_tensors(
             result[key] = _pad_cat_dim0(values, pad_value=pv)
         elif isinstance(values[0], list):
             result[key] = [item for v in values for item in v]
+        elif key in _PER_TRAJECTORY_SCALAR_METADATA_KEYS:
+            result[key] = list(values)
         else:
             result[key] = values[0]
 
@@ -350,6 +356,17 @@ def split_and_unpad_tensor(
                 )
                 for i, s in enumerate(splits):
                     split_result[i][key] = s
+            elif (
+                isinstance(value, list)
+                and key in _PER_TRAJECTORY_SCALAR_METADATA_KEYS
+                and len(value) == total
+            ):
+                offset = 0
+                for i, group_size in enumerate(traj_group_sizes):
+                    split_result[i][key] = copy.deepcopy(
+                        value[offset : offset + group_size]
+                    )
+                    offset += group_size
             else:
                 for i in range(n_trajs):
                     split_result[i][key] = copy.deepcopy(value)
