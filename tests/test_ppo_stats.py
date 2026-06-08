@@ -2,6 +2,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from areal.api.cli_args import RejectionSamplingConfig
 from areal.trainer.ppo.actor import grpo_loss_fn
 from areal.trainer.ppo.critic import ppo_loss_fn
 from areal.trainer.ppo.stats import infer_token_denominator
@@ -85,6 +86,54 @@ def test_grpo_loss_fn_uses_full_cu_seqlens_for_n_tokens():
     )
     assert n_tokens.shape == torch.Size([4])
     assert torch.all(n_tokens)
+
+
+def test_grpo_loss_fn_trace_stat_callback_receives_behavior_stats():
+    prox_logp = torch.log(torch.tensor([[1.0, 2.0, 3.0]]))
+    input_data = {
+        "input_ids": torch.tensor([[11, 12, 13]]),
+        "logprobs": torch.zeros(1, 3),
+        "advantages": torch.ones(1, 3),
+        "loss_mask": torch.tensor([[True, True, False]]),
+        "prox_logp": prox_logp,
+    }
+    captured_stats = []
+
+    with patch("areal.trainer.ppo.actor.stats_tracker") as mock_tracker:
+        mock_tracker.denominator = MagicMock()
+        mock_tracker.stat = MagicMock()
+        mock_tracker.scalar = MagicMock()
+
+        grpo_loss_fn(
+            logprobs=torch.zeros(1, 3),
+            entropy=torch.zeros(1, 3),
+            input_data=input_data,
+            eps_clip=0.2,
+            eps_clip_higher=None,
+            c_clip=None,
+            rejection_sampling=RejectionSamplingConfig(
+                level="token",
+                action="clamp",
+                metric="ratio",
+                upper=10.0,
+            ),
+            trace_stat_callback=captured_stats.append,
+        )
+
+    assert len(captured_stats) == 1
+    stat = captured_stats[0]
+    torch.testing.assert_close(
+        stat["behave_imp_weight"],
+        torch.tensor([[1.0, 2.0, 0.0]]),
+    )
+    torch.testing.assert_close(
+        stat["behave_approx_kl"],
+        torch.tensor([[0.0, torch.log(torch.tensor(2.0)).item(), 0.0]]),
+    )
+    assert torch.equal(
+        stat["behave_mask"],
+        torch.tensor([[True, True, False]]),
+    )
 
 
 def test_critic_loss_fn_uses_full_cu_seqlens_for_n_tokens():

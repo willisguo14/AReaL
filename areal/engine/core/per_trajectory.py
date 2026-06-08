@@ -37,6 +37,49 @@ class LogprobSummary:
 
 
 @dataclass(frozen=True)
+class MaskedTensorSummary:
+    min: float | None
+    max: float | None
+    mean: float | None
+    count: int
+
+
+class MaskedTensorAccumulator:
+    def __init__(self) -> None:
+        self.total = 0.0
+        self.count = 0
+        self.min: float | None = None
+        self.max: float | None = None
+
+    def add(self, values: torch.Tensor, mask: torch.Tensor) -> None:
+        if values.shape != mask.shape:
+            raise ValueError(
+                "masked tensor summary shape mismatch: "
+                f"values shape {tuple(values.shape)} vs mask shape {tuple(mask.shape)}"
+            )
+        selected = values[mask.bool()].detach().to(dtype=torch.float32)
+        if selected.numel() == 0:
+            return
+
+        self.total += float(selected.sum().item())
+        self.count += int(selected.numel())
+        min_value = float(selected.min().item())
+        max_value = float(selected.max().item())
+        self.min = min_value if self.min is None else min(self.min, min_value)
+        self.max = max_value if self.max is None else max(self.max, max_value)
+
+    def summary(self) -> MaskedTensorSummary:
+        if self.count == 0:
+            return MaskedTensorSummary(min=None, max=None, mean=None, count=0)
+        return MaskedTensorSummary(
+            min=self.min,
+            max=self.max,
+            mean=self.total / self.count,
+            count=self.count,
+        )
+
+
+@dataclass(frozen=True)
 class PerTrajectoryRecord:
     trainer_global_step: int
     minibatch_idx: int
@@ -49,6 +92,12 @@ class PerTrajectoryRecord:
     logprob_infer_mean: float
     reward: float
     response_length: int
+    behave_imp_weight_min: float | None = None
+    behave_imp_weight_max: float | None = None
+    behave_imp_weight_mean: float | None = None
+    behave_approx_kl_min: float | None = None
+    behave_approx_kl_max: float | None = None
+    behave_approx_kl_mean: float | None = None
 
 
 def normalize_flush_threshold(value: Any) -> int:

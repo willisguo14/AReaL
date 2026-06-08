@@ -8,6 +8,7 @@ import torch
 
 import areal.engine.core.per_trajectory as per_trajectory_module
 from areal.engine.core.per_trajectory import (
+    MaskedTensorAccumulator,
     PerTrajectoryRecord,
     PerTrajectoryTracer,
     attach_trainer_step_metadata,
@@ -76,6 +77,47 @@ def test_summarize_logprobs_uses_original_response_mask():
 def test_summarize_logprobs_rejects_empty_response():
     with pytest.raises(ValueError, match="response_length"):
         summarize_logprobs(torch.zeros(1, 3), torch.zeros(1, 3, dtype=torch.bool))
+
+
+def test_masked_tensor_accumulator_summarizes_selected_values():
+    accumulator = MaskedTensorAccumulator()
+
+    accumulator.add(
+        torch.tensor([[1.0, 3.0, 9.0]]),
+        torch.tensor([[True, True, False]]),
+    )
+    accumulator.add(
+        torch.tensor([[-2.0, 7.0]]),
+        torch.tensor([[True, False]]),
+    )
+
+    summary = accumulator.summary()
+    assert summary.count == 3
+    assert summary.min == pytest.approx(-2.0)
+    assert summary.max == pytest.approx(3.0)
+    assert summary.mean == pytest.approx(2.0 / 3.0)
+
+
+def test_masked_tensor_accumulator_empty_mask_returns_null_summary():
+    accumulator = MaskedTensorAccumulator()
+
+    accumulator.add(
+        torch.tensor([[1.0, 3.0]]),
+        torch.tensor([[False, False]]),
+    )
+
+    summary = accumulator.summary()
+    assert summary.count == 0
+    assert summary.min is None
+    assert summary.max is None
+    assert summary.mean is None
+
+
+def test_masked_tensor_accumulator_rejects_shape_mismatch():
+    accumulator = MaskedTensorAccumulator()
+
+    with pytest.raises(ValueError, match="shape mismatch"):
+        accumulator.add(torch.ones(1, 2), torch.ones(2, dtype=torch.bool))
 
 
 def test_preserve_rollout_logprobs_copies_before_mutation():
@@ -478,7 +520,7 @@ def test_tracer_explicit_flush_creates_parent_and_writes_sorted_jsonl(tmp_path):
     assert path.read_text(encoding="utf-8") == (expected + "\n")
     assert ": " not in expected
     assert ", " not in expected
-    assert expected.startswith('{"grad_norm":')
+    assert expected.startswith('{"behave_approx_kl_max":')
 
 
 def test_tracer_rejects_non_finite_values(tmp_path):

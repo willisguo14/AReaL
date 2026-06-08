@@ -4,6 +4,8 @@
 
 from areal.engine.core.per_trajectory import (
     LogprobSummary,
+    MaskedTensorAccumulator,
+    MaskedTensorSummary,
     PerTrajectoryRecord,
     PerTrajectoryTracer,
     attach_trainer_step_metadata,
@@ -24,6 +26,8 @@ __all__ = [
     "aggregate_eval_losses",
     "compute_total_loss_weight",
     "LogprobSummary",
+    "MaskedTensorAccumulator",
+    "MaskedTensorSummary",
     "PerTrajectoryRecord",
     "PerTrajectoryTracer",
     "attach_trainer_step_metadata",

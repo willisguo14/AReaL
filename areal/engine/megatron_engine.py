@@ -48,6 +48,7 @@ from areal.api import (
 from areal.api.cli_args import MicroBatchSpec, PerfTracerConfig, TrainEngineConfig
 from areal.api.io_struct import DeviceRuntimeInfo
 from areal.engine.core import (
+    MaskedTensorAccumulator,
     PerTrajectoryRecord,
     PerTrajectoryTracer,
     aggregate_eval_losses,
@@ -1181,6 +1182,8 @@ class MegatronEngine(TrainEngine):
 
                 train_logprob_sum = 0.0
                 train_response_length = 0
+                behave_imp_weight_accum = MaskedTensorAccumulator()
+                behave_approx_kl_accum = MaskedTensorAccumulator()
 
                 def capture_logprobs(
                     logprobs: torch.Tensor,
@@ -1194,6 +1197,17 @@ class MegatronEngine(TrainEngine):
                     train_logprob_sum += summary.sum
                     train_response_length += summary.length
 
+                def capture_loss_stats(stat: dict[str, Any]) -> None:
+                    behave_mask = stat.get("behave_mask")
+                    if not isinstance(behave_mask, torch.Tensor):
+                        return
+                    behave_imp_weight = stat.get("behave_imp_weight")
+                    if isinstance(behave_imp_weight, torch.Tensor):
+                        behave_imp_weight_accum.add(behave_imp_weight, behave_mask)
+                    behave_approx_kl = stat.get("behave_approx_kl")
+                    if isinstance(behave_approx_kl, torch.Tensor):
+                        behave_approx_kl_accum.add(behave_approx_kl, behave_mask)
+
                 def process_output(
                     output: torch.Tensor,
                     inputs: dict[str, Any],
@@ -1206,6 +1220,7 @@ class MegatronEngine(TrainEngine):
                         total_loss_weight,
                         loss_multiplier=loss_multiplier,
                         logprob_callback=capture_logprobs,
+                        loss_stat_callback=capture_loss_stats,
                     )
 
                 self.forward_backward_batch(
@@ -1232,6 +1247,8 @@ class MegatronEngine(TrainEngine):
                     traj_batch["rollout_logprobs"],
                     traj_batch.get("rollout_loss_mask", traj_batch["loss_mask"]),
                 )
+                behave_imp_weight_summary = behave_imp_weight_accum.summary()
+                behave_approx_kl_summary = behave_approx_kl_accum.summary()
                 trainer_global_step = self._extract_scalar_from_batch(
                     traj_batch,
                     "trainer_global_step",
@@ -1259,6 +1276,12 @@ class MegatronEngine(TrainEngine):
                         logprob_infer_mean=rollout_summary.mean,
                         reward=self._reward_from_batch(traj_batch),
                         response_length=rollout_summary.length,
+                        behave_imp_weight_min=behave_imp_weight_summary.min,
+                        behave_imp_weight_max=behave_imp_weight_summary.max,
+                        behave_imp_weight_mean=behave_imp_weight_summary.mean,
+                        behave_approx_kl_min=behave_approx_kl_summary.min,
+                        behave_approx_kl_max=behave_approx_kl_summary.max,
+                        behave_approx_kl_mean=behave_approx_kl_summary.mean,
                     )
                 )
                 self.optimizer_zero_grad()
@@ -2374,6 +2397,7 @@ class MegatronEngine(TrainEngine):
         total_loss_weight: torch.Tensor,
         loss_multiplier: float = 1.0,
         logprob_callback: Callable[[torch.Tensor, dict[str, Any]], None] | None = None,
+        loss_stat_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> torch.Tensor:
         local_weight = loss_weight_fn(inputs)
         if local_weight == 0:
@@ -2470,12 +2494,17 @@ class MegatronEngine(TrainEngine):
                     }
             if logprob_callback is not None:
                 logprob_callback(logprobs.detach(), inputs)
+            loss_kwargs: dict[str, Any] = {
+                "vocab_min_logits": vocab_min_logits,
+                "vocab_max_logits": vocab_max_logits,
+            }
+            if loss_stat_callback is not None:
+                loss_kwargs["trace_stat_callback"] = loss_stat_callback
             loss = loss_fn(
                 logprobs,
                 entropy,
                 inputs,
-                vocab_min_logits=vocab_min_logits,
-                vocab_max_logits=vocab_max_logits,
+                **loss_kwargs,
             )
         else:
             values = output.squeeze(-1)

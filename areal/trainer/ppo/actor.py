@@ -2,6 +2,7 @@
 
 import functools
 import math
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -766,6 +767,7 @@ def grpo_loss_fn(
     use_decoupled_loss: bool = False,
     vocab_min_logits: torch.Tensor | None = None,
     vocab_max_logits: torch.Tensor | None = None,
+    trace_stat_callback: Callable[[dict[str, Any]], None] | None = None,
 ):
     """Loss function for actor step, all inputs should be splitted into
     pipeline micro batches, returns loss and logging stats."""
@@ -821,6 +823,9 @@ def grpo_loss_fn(
             importance_sampling_level=importance_sampling_level,
             cu_seqlens=input_data.get("cu_seqlens"),
         )
+
+    if trace_stat_callback is not None:
+        trace_stat_callback(stat)
 
     # Joint Distillation KL Loss
     teacher_logp = input_data.get("teacher_logp")
