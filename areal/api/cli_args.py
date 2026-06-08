@@ -2443,6 +2443,20 @@ class RecoverConfig(_Timer):
         default=3,
         metadata={"help": "Number of recovery retries when recovery is enabled."},
     )
+    keep_last: int = field(
+        default=1,
+        metadata={
+            "help": "Number of recent recovery checkpoints to retain. "
+            "A value of 1 preserves legacy overwrite behavior."
+        },
+    )
+    load_step: int | None = field(
+        default=None,
+        metadata={
+            "help": "Exact global_step recovery history checkpoint to load. "
+            "Only applies to recover_history/globalstep_<N> checkpoints."
+        },
+    )
     no_save_optim: bool = field(
         default=False,
         metadata={
@@ -2466,6 +2480,20 @@ class RecoverConfig(_Timer):
                 f"Valid options: {valid_modes}. "
                 f"Note: 'fault' and 'resume' modes have been removed."
             )
+
+        if not isinstance(self.keep_last, int) or isinstance(self.keep_last, bool):
+            raise ValueError("recover.keep_last must be a positive integer.")
+        if self.keep_last < 1:
+            raise ValueError("recover.keep_last must be a positive integer.")
+        if self.load_step is not None:
+            if not isinstance(self.load_step, int) or isinstance(self.load_step, bool):
+                raise ValueError(
+                    "recover.load_step must be None or a non-negative integer."
+                )
+            if self.load_step < 0:
+                raise ValueError(
+                    "recover.load_step must be None or a non-negative integer."
+                )
 
 
 @dataclass

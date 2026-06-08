@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import dataclasses
+import getpass
 import json
 import os
 import pickle
+import re
+import shutil
 from typing import TYPE_CHECKING, Any
 
 import torch.distributed as dist
@@ -32,9 +35,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("Recover")
 
+RECOVER_HISTORY_DIR = "recover_history"
+RECOVER_COMPLETE_MARKER = ".complete"
+RECOVER_HISTORY_STEP_RE = re.compile(r"^globalstep_(\d+)$")
+
 
 class InValidRecoverInfo(Exception):
     pass
+
+
+@dataclasses.dataclass(frozen=True)
+class RecoveryRootSelection:
+    root: str
+    is_history: bool
+    step: int | None
 
 
 @dataclasses.dataclass
@@ -165,6 +179,155 @@ class RecoverHandler:
         )
 
     @staticmethod
+    def trial_root_path(
+        experiment_name: str,
+        trial_name: str,
+        fileroot: str,
+    ) -> str:
+        return os.path.join(
+            fileroot,
+            "checkpoints",
+            getpass.getuser(),
+            experiment_name,
+            trial_name,
+        )
+
+    @staticmethod
+    def history_root_path(trial_root: str) -> str:
+        return os.path.join(trial_root, RECOVER_HISTORY_DIR)
+
+    @staticmethod
+    def history_step_dirname(global_step: int) -> str:
+        return f"globalstep_{global_step:08d}"
+
+    @staticmethod
+    def history_step_path(trial_root: str, global_step: int) -> str:
+        return os.path.join(
+            RecoverHandler.history_root_path(trial_root),
+            RecoverHandler.history_step_dirname(global_step),
+        )
+
+    @staticmethod
+    def complete_marker_path(recovery_root: str) -> str:
+        return os.path.join(recovery_root, RECOVER_COMPLETE_MARKER)
+
+    @staticmethod
+    def _parse_history_step(dirname: str) -> int | None:
+        match = RECOVER_HISTORY_STEP_RE.match(dirname)
+        if match is None:
+            return None
+        step = int(match.group(1))
+        if dirname != RecoverHandler.history_step_dirname(step):
+            return None
+        return step
+
+    @staticmethod
+    def complete_history_steps(trial_root: str) -> list[tuple[int, str]]:
+        history_root = RecoverHandler.history_root_path(trial_root)
+        if not os.path.isdir(history_root):
+            return []
+        complete_steps: list[tuple[int, str]] = []
+        for dirname in os.listdir(history_root):
+            step = RecoverHandler._parse_history_step(dirname)
+            if step is None:
+                continue
+            path = os.path.join(history_root, dirname)
+            if not os.path.isdir(path):
+                continue
+            if not os.path.exists(RecoverHandler.complete_marker_path(path)):
+                continue
+            complete_steps.append((step, path))
+        return sorted(complete_steps, key=lambda item: item[0])
+
+    @staticmethod
+    def select_recovery_root(config: RecoverConfig) -> RecoveryRootSelection:
+        trial_root = RecoverHandler.trial_root_path(
+            config.experiment_name,
+            config.trial_name,
+            config.fileroot,
+        )
+        complete_steps = RecoverHandler.complete_history_steps(trial_root)
+        available_steps = [step for step, _ in complete_steps]
+        if config.load_step is not None:
+            requested_path = RecoverHandler.history_step_path(
+                trial_root, config.load_step
+            )
+            if os.path.exists(RecoverHandler.complete_marker_path(requested_path)):
+                return RecoveryRootSelection(
+                    root=requested_path,
+                    is_history=True,
+                    step=config.load_step,
+                )
+            if os.path.isdir(requested_path):
+                raise ValueError(
+                    f"Requested recovery step {config.load_step} exists but is incomplete. "
+                    f"Available complete recovery steps: {available_steps}"
+                )
+            raise ValueError(
+                f"Requested recovery step {config.load_step} was not found. "
+                f"Available complete recovery steps: {available_steps}"
+            )
+        if complete_steps:
+            step, path = complete_steps[-1]
+            return RecoveryRootSelection(root=path, is_history=True, step=step)
+        return RecoveryRootSelection(root=trial_root, is_history=False, step=None)
+
+    @staticmethod
+    def _is_rank_zero() -> bool:
+        return not dist.is_initialized() or dist.get_rank() == 0
+
+    @staticmethod
+    def _recover_info_path_for_root(recovery_root: str) -> str:
+        return os.path.join(recovery_root, "recover_info")
+
+    @staticmethod
+    def _recover_checkpoint_path_for_root(recovery_root: str, name: str) -> str:
+        path = os.path.join(recovery_root, name, "recover_checkpoint")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    @staticmethod
+    def has_recover_checkpoints(recovery_root: str) -> bool:
+        if not os.path.isdir(recovery_root):
+            return False
+        found_checkpoint = False
+        for name in os.listdir(recovery_root):
+            if name in {"recover_info", RECOVER_HISTORY_DIR}:
+                continue
+            model_root = os.path.join(recovery_root, name)
+            if not os.path.isdir(model_root):
+                continue
+            checkpoint_path = os.path.join(model_root, "recover_checkpoint")
+            if not os.path.isdir(checkpoint_path):
+                logger.warning(f"Recover checkpoint for model {name} does not exist.")
+                return False
+            found_checkpoint = True
+        if not found_checkpoint:
+            logger.warning(f"No recover checkpoints found under {recovery_root}.")
+        return found_checkpoint
+
+    @staticmethod
+    def _write_complete_marker(recovery_root: str, global_step: int) -> None:
+        if not RecoverHandler._is_rank_zero():
+            return
+        marker_path = RecoverHandler.complete_marker_path(recovery_root)
+        with open(marker_path, "w") as f:
+            f.write(f"{global_step}\n")
+
+    def _prune_history(self) -> None:
+        if not self._is_rank_zero():
+            return
+        trial_root = self.trial_root_path(
+            self.config.experiment_name,
+            self.config.trial_name,
+            self.config.fileroot,
+        )
+        complete_steps = self.complete_history_steps(trial_root)
+        stale_steps = complete_steps[: -self.config.keep_last]
+        for _, path in stale_steps:
+            shutil.rmtree(path)
+
+    @staticmethod
     def recover_info_path(
         experiment_name: str,
         trial_name: str,
@@ -240,6 +403,21 @@ class RecoverHandler:
             steps=1,
         ):
             return
+        recovery_root: str | None = None
+        if self.config.keep_last > 1:
+            trial_root = self.trial_root_path(
+                self.config.experiment_name,
+                self.config.trial_name,
+                self.config.fileroot,
+            )
+            recovery_root = self.history_step_path(trial_root, step_info.global_step)
+            if self._is_rank_zero():
+                os.makedirs(recovery_root, exist_ok=True)
+                marker_path = self.complete_marker_path(recovery_root)
+                if os.path.exists(marker_path):
+                    os.remove(marker_path)
+            if dist.is_initialized():
+                dist.barrier()
         normalized_engine: dict[str, TrainEngine | TrainController] = (
             self._normalize_recover_engines(engine)
         )
@@ -250,6 +428,7 @@ class RecoverHandler:
                 tokenizer=tokenizer,
                 processor=processor,
                 base_model_path=base_model_path,
+                recovery_root=recovery_root,
             )
 
         self.last_step_info = step_info
@@ -262,12 +441,18 @@ class RecoverHandler:
             checkpoint_info=self.freq_ctl.state_dict(),
         )
 
-        recover_info_path = self.recover_info_path(
-            self.config.experiment_name,
-            self.config.trial_name,
-            self.config.fileroot,
-        )
+        if recovery_root is None:
+            recover_info_path = self.recover_info_path(
+                self.config.experiment_name,
+                self.config.trial_name,
+                self.config.fileroot,
+            )
+        else:
+            recover_info_path = self._recover_info_path_for_root(recovery_root)
         recover_info.dump(recover_info_path)
+        if recovery_root is not None:
+            self._write_complete_marker(recovery_root, step_info.global_step)
+            self._prune_history()
 
     def load(
         self,
@@ -294,11 +479,8 @@ class RecoverHandler:
             self._normalize_recover_engines(engine)
         )
 
-        recover_info_path = self.recover_info_path(
-            self.config.experiment_name,
-            self.config.trial_name,
-            self.config.fileroot,
-        )
+        selected_root = self.select_recovery_root(self.config)
+        recover_info_path = self._recover_info_path_for_root(selected_root.root)
         logger.info(f"Loading recover info from {recover_info_path}")
         try:
             recover_info: RecoverInfo = RecoverInfo.load(recover_info_path)
@@ -309,8 +491,13 @@ class RecoverHandler:
             stats_logger.load_state_dict(recover_info.stats_logger_info)
             dataloader.load_state_dict(recover_info.dataloader_info)
 
+            checkpoint_root = selected_root.root if selected_root.is_history else None
             for name, engine_ in normalized_engine.items():
-                self._load_checkpoint(engine_, name=name)
+                self._load_checkpoint(
+                    engine_,
+                    name=name,
+                    recovery_root=checkpoint_root,
+                )
             global_step = recover_info.last_step_info.global_step
 
             if inference_engine is not None:
@@ -338,13 +525,17 @@ class RecoverHandler:
         tokenizer: PreTrainedTokenizerFast | None = None,
         processor: AutoProcessor | None = None,
         base_model_path: str | None = None,
+        recovery_root: str | None = None,
     ):
-        path = Saver.get_recover_checkpoint_path(
-            self.config.experiment_name,
-            self.config.trial_name,
-            self.config.fileroot,
-            name=name,
-        )
+        if recovery_root is None:
+            path = Saver.get_recover_checkpoint_path(
+                self.config.experiment_name,
+                self.config.trial_name,
+                self.config.fileroot,
+                name=name,
+            )
+        else:
+            path = self._recover_checkpoint_path_for_root(recovery_root, name)
         weight_format = "dcp"
         with_optim = not self.config.no_save_optim
         meta = SaveLoadMeta(
@@ -364,13 +555,17 @@ class RecoverHandler:
         name: str = "default",
         tokenizer: PreTrainedTokenizerFast | None = None,
         base_model_path: str | None = None,
+        recovery_root: str | None = None,
     ):
-        path = Saver.get_recover_checkpoint_path(
-            self.config.experiment_name,
-            self.config.trial_name,
-            self.config.fileroot,
-            name=name,
-        )
+        if recovery_root is None:
+            checkpoint_root = self.trial_root_path(
+                self.config.experiment_name,
+                self.config.trial_name,
+                self.config.fileroot,
+            )
+        else:
+            checkpoint_root = recovery_root
+        path = os.path.join(checkpoint_root, name, "recover_checkpoint")
         if not os.path.exists(path):
             raise FileNotFoundError(f"Checkpoint path {path} does not exist.")
         weight_format = "dcp"
@@ -389,12 +584,8 @@ class RecoverHandler:
 def check_if_auto_recover(config: RecoverConfig) -> bool:
     # This method is called by check_if_recover to check if the experiment should
     # recover from a previous run when recovery is enabled ("on" or "auto" mode).
-    experiment_name = config.experiment_name
-    trial_name = config.trial_name
-    fileroot = config.fileroot
-    recover_info_path = RecoverHandler.recover_info_path(
-        experiment_name, trial_name, fileroot
-    )
+    selected_root = RecoverHandler.select_recovery_root(config)
+    recover_info_path = RecoverHandler._recover_info_path_for_root(selected_root.root)
     logger.info(f"Searching for recover info file in {recover_info_path}.")
     if os.path.exists(str(recover_info_path)):
         try:
@@ -411,17 +602,7 @@ def check_if_auto_recover(config: RecoverConfig) -> bool:
             logger.warning(msg)
             return False
 
-        save_root = Saver.get_save_root(experiment_name, trial_name, fileroot)
-        for name in os.listdir(save_root):
-            if not os.path.isdir(os.path.join(save_root, name)):
-                continue
-            path = Saver.get_recover_checkpoint_path(
-                experiment_name, trial_name, fileroot, name=name
-            )
-            if not os.path.exists(path):
-                logger.warning(f"Recover checkpoint for model {name} does not exist.")
-                return False
-        return True
+        return RecoverHandler.has_recover_checkpoints(selected_root.root)
     logger.warning(f"Recover info not found at: {recover_info_path}")
     return False
 
