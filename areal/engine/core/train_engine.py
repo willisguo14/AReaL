@@ -6,7 +6,9 @@ This module provides stateless utility functions that are shared across
 different training engine implementations (FSDP, Megatron, etc.).
 """
 
+import math
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -21,10 +23,97 @@ from areal.utils.data import (
 )
 
 __all__ = [
+    "LOGP_GRAD_ABSMAX_KEY",
+    "LOGP_GRAD_NORM_KEY",
+    "LogprobGradAccumulator",
     "compute_total_loss_weight",
     "aggregate_eval_losses",
     "reorder_and_pad_outputs",
 ]
+
+
+LOGP_GRAD_NORM_KEY = "logp_grad_norm"
+LOGP_GRAD_ABSMAX_KEY = "logp_grad_absmax"
+
+
+@dataclass(frozen=True)
+class _ReductionGroup:
+    group: dist.ProcessGroup | None
+    sum_divisor: float = 1.0
+
+
+class LogprobGradAccumulator:
+    """Accumulate ||dL/dlogprobs|| and max |dL/dlogprobs| for one train step."""
+
+    def __init__(self, device: torch.device | str | int | None = None) -> None:
+        if device is None:
+            device = current_platform.current_device()
+        self._sum_sq = torch.zeros((), dtype=torch.float32, device=device)
+        self._abs_max = torch.zeros((), dtype=torch.float32, device=device)
+
+    def add(
+        self,
+        loss: torch.Tensor,
+        logprobs: torch.Tensor,
+        loss_scale: torch.Tensor | float,
+    ) -> None:
+        scaled_loss = loss * loss_scale
+        grad = torch.autograd.grad(
+            scaled_loss,
+            logprobs,
+            retain_graph=True,
+            allow_unused=True,
+        )[0]
+        if grad is None or grad.numel() == 0:
+            return
+
+        grad = grad.detach().to(dtype=torch.float32)
+        self._sum_sq += torch.sum(grad * grad)
+        self._abs_max = torch.maximum(self._abs_max, grad.abs().max())
+
+    def summary(
+        self,
+        *groups: tuple[dist.ProcessGroup | None, float] | dist.ProcessGroup | None,
+    ) -> dict[str, float]:
+        sum_sq = self._sum_sq.detach().clone()
+        abs_max = self._abs_max.detach().clone()
+
+        for reduction in self._normalize_groups(groups):
+            if (
+                reduction.group is not None
+                and dist.is_available()
+                and dist.is_initialized()
+            ):
+                dist.all_reduce(sum_sq, op=dist.ReduceOp.SUM, group=reduction.group)
+                dist.all_reduce(abs_max, op=dist.ReduceOp.MAX, group=reduction.group)
+            if reduction.sum_divisor != 1.0:
+                sum_sq /= reduction.sum_divisor
+
+        sum_sq_value = max(float(sum_sq.item()), 0.0)
+        return {
+            LOGP_GRAD_NORM_KEY: math.sqrt(sum_sq_value),
+            LOGP_GRAD_ABSMAX_KEY: float(abs_max.item()),
+        }
+
+    @staticmethod
+    def _normalize_groups(
+        groups: tuple[
+            tuple[dist.ProcessGroup | None, float] | dist.ProcessGroup | None, ...
+        ],
+    ) -> tuple[_ReductionGroup, ...]:
+        reductions = []
+        for group in groups:
+            if isinstance(group, tuple):
+                process_group, divisor = group
+            else:
+                process_group, divisor = group, 1.0
+            divisor = float(divisor)
+            if divisor <= 0.0:
+                raise ValueError(
+                    f"logprob grad sum divisor must be positive, got {divisor}"
+                )
+            reductions.append(_ReductionGroup(process_group, divisor))
+        return tuple(reductions)
 
 
 def compute_total_loss_weight(

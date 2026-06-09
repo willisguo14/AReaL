@@ -74,8 +74,17 @@ def test_per_trajectory_disabled_uses_normal_train_batch(monkeypatch):
 
     actor._ppo_update(_minimal_batch())
 
-    engine.train_batch.assert_called_once_with(ANY, loss_fn=ANY, loss_weight_fn=ANY)
-    assert set(engine.train_batch.call_args.kwargs) == {"loss_fn", "loss_weight_fn"}
+    engine.train_batch.assert_called_once_with(
+        ANY,
+        collect_logprob_grad_stats=True,
+        loss_fn=ANY,
+        loss_weight_fn=ANY,
+    )
+    assert set(engine.train_batch.call_args.kwargs) == {
+        "collect_logprob_grad_stats",
+        "loss_fn",
+        "loss_weight_fn",
+    }
     normal_mb = engine.train_batch.call_args.args[0]
     assert "task_reward" not in normal_mb
     engine.train_batch_per_trajectory.assert_not_called()
@@ -123,8 +132,20 @@ def test_per_trajectory_enabled_uses_replacement_path(monkeypatch):
     engine.train_batch.assert_not_called()
     engine.train_batch_per_trajectory.assert_has_calls(
         [
-            call(ANY, minibatch_idx=0, loss_fn=ANY, loss_weight_fn=ANY),
-            call(ANY, minibatch_idx=1, loss_fn=ANY, loss_weight_fn=ANY),
+            call(
+                ANY,
+                minibatch_idx=0,
+                collect_logprob_grad_stats=True,
+                loss_fn=ANY,
+                loss_weight_fn=ANY,
+            ),
+            call(
+                ANY,
+                minibatch_idx=1,
+                collect_logprob_grad_stats=True,
+                loss_fn=ANY,
+                loss_weight_fn=ANY,
+            ),
         ]
     )
     assert engine.train_batch_per_trajectory.call_count == 2

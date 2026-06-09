@@ -17,6 +17,9 @@ from areal.engine.core.per_trajectory import (
     trajectory_id_from_sample,
 )
 from areal.engine.core.train_engine import (
+    LOGP_GRAD_ABSMAX_KEY,
+    LOGP_GRAD_NORM_KEY,
+    LogprobGradAccumulator,
     aggregate_eval_losses,
     compute_total_loss_weight,
     reorder_and_pad_outputs,
@@ -25,6 +28,9 @@ from areal.engine.core.train_engine import (
 __all__ = [
     "aggregate_eval_losses",
     "compute_total_loss_weight",
+    "LOGP_GRAD_ABSMAX_KEY",
+    "LOGP_GRAD_NORM_KEY",
+    "LogprobGradAccumulator",
     "LogprobSummary",
     "MaskedTensorAccumulator",
     "MaskedTensorSummary",

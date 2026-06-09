@@ -48,6 +48,7 @@ from areal.api import (
 from areal.api.cli_args import MicroBatchSpec, PerfTracerConfig, TrainEngineConfig
 from areal.api.io_struct import DeviceRuntimeInfo
 from areal.engine.core import (
+    LogprobGradAccumulator,
     MaskedTensorAccumulator,
     PerTrajectoryRecord,
     PerTrajectoryTracer,
@@ -1056,6 +1057,7 @@ class MegatronEngine(TrainEngine):
         input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        collect_logprob_grad_stats: bool = False,
     ) -> dict[str, float]:
         self._ensure_ready()
         self.optimizer_zero_grad()
@@ -1075,6 +1077,11 @@ class MegatronEngine(TrainEngine):
             loss_weight_fn,
             mpu.get_data_parallel_group(with_context_parallel=True),
         )
+        logprob_grad_accum = (
+            LogprobGradAccumulator(self.device)
+            if collect_logprob_grad_stats and not self.config.is_critic
+            else None
+        )
 
         # Step 3: Forward-backward using Megatron's pipeline function.
         # `len(mb_list)` compensates Megatron Core's `output_tensor /= num_microbatches`
@@ -1088,6 +1095,9 @@ class MegatronEngine(TrainEngine):
             * self.optimizer.get_loss_scale().item()
             * len(mb_list)
         )
+        logprob_grad_loss_multiplier = (
+            mpu.get_data_parallel_world_size() * mpu.get_context_parallel_world_size()
+        )
 
         def process_output(
             output: torch.Tensor, inputs: dict[str, Any]
@@ -1099,6 +1109,8 @@ class MegatronEngine(TrainEngine):
                 loss_weight_fn,
                 total_loss_weight,
                 loss_multiplier=loss_multiplier,
+                logprob_grad_accumulator=logprob_grad_accum,
+                logprob_grad_loss_multiplier=logprob_grad_loss_multiplier,
             )
 
         self.forward_backward_batch(
@@ -1123,6 +1135,19 @@ class MegatronEngine(TrainEngine):
         )
         if grad_cos_sim is not None:
             stats["grad_cos_sim"] = float(grad_cos_sim)
+        if logprob_grad_accum is not None:
+            stats.update(
+                logprob_grad_accum.summary(
+                    (
+                        mpu.get_data_parallel_group(with_context_parallel=True),
+                        mpu.get_context_parallel_world_size(),
+                    ),
+                    (
+                        mpu.get_tensor_model_parallel_group(),
+                        mpu.get_tensor_model_parallel_world_size(),
+                    ),
+                )
+            )
         stats["num_micro_batches"] = len(mb_list.mbs)
         return stats
 
@@ -1133,6 +1158,7 @@ class MegatronEngine(TrainEngine):
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
         *,
         minibatch_idx: int,
+        collect_logprob_grad_stats: bool = False,
     ) -> dict[str, float]:
         self._ensure_ready()
         self._validate_per_trajectory_supported()
@@ -1155,6 +1181,11 @@ class MegatronEngine(TrainEngine):
             tracer = self._make_per_trajectory_tracer(input_batched)
             dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
             dp_world_size = int(dist.get_world_size(dp_group))
+            logprob_grad_accum = (
+                LogprobGradAccumulator(self.device)
+                if collect_logprob_grad_stats and not self.config.is_critic
+                else None
+            )
             if dp_world_size > 1:
                 dp_sync_state = disable_dp_sync(self.model)
 
@@ -1212,6 +1243,10 @@ class MegatronEngine(TrainEngine):
                     output: torch.Tensor,
                     inputs: dict[str, Any],
                 ) -> torch.Tensor:
+                    kwargs: dict[str, Any] = {}
+                    if logprob_grad_accum is not None:
+                        kwargs["logprob_grad_accumulator"] = logprob_grad_accum
+                        kwargs["logprob_grad_loss_multiplier"] = dp_loss_multiplier
                     return self._compute_logprobs_and_loss(
                         output,
                         inputs,
@@ -1221,6 +1256,7 @@ class MegatronEngine(TrainEngine):
                         loss_multiplier=loss_multiplier,
                         logprob_callback=capture_logprobs,
                         loss_stat_callback=capture_loss_stats,
+                        **kwargs,
                     )
 
                 self.forward_backward_batch(
@@ -1304,6 +1340,16 @@ class MegatronEngine(TrainEngine):
             )
             if grad_cos_sim is not None:
                 stats["grad_cos_sim"] = float(grad_cos_sim)
+            if logprob_grad_accum is not None:
+                stats.update(
+                    logprob_grad_accum.summary(
+                        (dp_group, 1.0),
+                        (
+                            mpu.get_tensor_model_parallel_group(),
+                            mpu.get_tensor_model_parallel_world_size(),
+                        ),
+                    )
+                )
             stats["num_micro_batches"] = len(full_mb_list.mbs)
             return stats
         finally:
@@ -2398,6 +2444,8 @@ class MegatronEngine(TrainEngine):
         loss_multiplier: float = 1.0,
         logprob_callback: Callable[[torch.Tensor, dict[str, Any]], None] | None = None,
         loss_stat_callback: Callable[[dict[str, Any]], None] | None = None,
+        logprob_grad_accumulator: LogprobGradAccumulator | None = None,
+        logprob_grad_loss_multiplier: float | None = None,
     ) -> torch.Tensor:
         local_weight = loss_weight_fn(inputs)
         if local_weight == 0:
@@ -2511,6 +2559,17 @@ class MegatronEngine(TrainEngine):
             loss = loss_fn(values, inputs)
 
         loss_scale = local_weight / total_loss_weight * loss_multiplier
+        if logprob_grad_accumulator is not None and not self.config.is_critic:
+            logprob_grad_loss_scale = (
+                local_weight
+                / total_loss_weight
+                * (
+                    loss_multiplier
+                    if logprob_grad_loss_multiplier is None
+                    else logprob_grad_loss_multiplier
+                )
+            )
+            logprob_grad_accumulator.add(loss, logprobs, logprob_grad_loss_scale)
         return loss * loss_scale
 
     def _compute_forward_result(

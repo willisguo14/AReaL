@@ -10,6 +10,7 @@ import torch.distributed as dist
 
 from areal.api import TrainEngine
 from areal.api.cli_args import MicroBatchSpec, PPOActorConfig, RejectionSamplingConfig
+from areal.engine.core import LOGP_GRAD_ABSMAX_KEY
 from areal.experimental.training_service.controller.controller import (
     GatewayTrainController,
 )
@@ -587,6 +588,7 @@ class PPOActor:
             token_ess_stats = []
             selected_ess_stats = []
             ess_lrs: list[float] = []
+            logp_grad_absmax_values: list[float] = []
 
             for mb_idx, mb in enumerate(mb_inputs.mbs):
                 sequence_ess_stat = None
@@ -651,6 +653,7 @@ class PPOActor:
                     use_decoupled_loss=self.config.use_decoupled_loss,
                 )
                 common_kwargs = {
+                    "collect_logprob_grad_stats": True,
                     "loss_fn": actor_loss_fn,
                     "loss_weight_fn": lambda x: x["loss_mask"].count_nonzero(),
                     **train_batch_kwargs,
@@ -674,6 +677,14 @@ class PPOActor:
                 grad_cos_sim = train_stat.pop("grad_cos_sim", None)
                 if grad_cos_sim is not None and math.isfinite(float(grad_cos_sim)):
                     grad_cos_sims.append(float(grad_cos_sim))
+                logp_grad_absmax = train_stat.pop(
+                    LOGP_GRAD_ABSMAX_KEY,
+                    None,
+                )
+                if logp_grad_absmax is not None:
+                    value = float(logp_grad_absmax)
+                    if math.isfinite(value):
+                        logp_grad_absmax_values.append(value)
                 if (
                     ess_scaling is not None
                     and selected_ess_stat is not None
@@ -707,6 +718,10 @@ class PPOActor:
             grad_cos_summary = _summarize_grad_cos_sims(grad_cos_sims)
             if grad_cos_summary:
                 stats_tracker.scalar(**grad_cos_summary)
+            if logp_grad_absmax_values:
+                stats_tracker.scalar(
+                    **{LOGP_GRAD_ABSMAX_KEY: max(logp_grad_absmax_values)}
+                )
 
 
 class PPOActorController(TrainController):

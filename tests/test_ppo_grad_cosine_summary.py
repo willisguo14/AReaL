@@ -49,6 +49,7 @@ class _StatsRecorder:
 class _FakeEngine:
     def __init__(self, train_stats):
         self._train_stats = list(train_stats)
+        self.train_batch_kwargs = []
 
     def train(self):
         pass
@@ -57,6 +58,7 @@ class _FakeEngine:
         return 7
 
     def train_batch(self, *args, **kwargs):
+        self.train_batch_kwargs.append(kwargs)
         return dict(self._train_stats.pop(0))
 
 
@@ -160,3 +162,46 @@ def test_ppo_update_omits_summary_when_no_finite_grad_cos_sim(monkeypatch):
 
     assert all("grad_cos_sim" not in call for call in recorder.scalar_calls)
     assert all("grad_cos_sim_abs/max" not in call for call in recorder.scalar_calls)
+
+
+def test_ppo_update_logs_logp_grad_absmax_as_update_max(monkeypatch):
+    recorder = _StatsRecorder()
+    monkeypatch.setattr(actor_module, "stats_tracker", recorder)
+    monkeypatch.setattr(
+        actor_module,
+        "split_padded_tensor_dict_into_mb_list",
+        lambda data, mb_spec: SimpleNamespace(
+            mbs=[
+                {"loss_mask": torch.ones(1, dtype=torch.bool)}
+                for _ in range(mb_spec.n_mbs)
+            ]
+        ),
+    )
+    actor = _make_actor(
+        [
+            {
+                "loss": 1.0,
+                "logp_grad_norm": 2.0,
+                "logp_grad_absmax": 0.5,
+            },
+            {
+                "loss": 2.0,
+                "logp_grad_norm": 3.0,
+                "logp_grad_absmax": 4.0,
+            },
+        ]
+    )
+
+    actor._ppo_update(_make_data())
+
+    per_minibatch_calls = [
+        call for call in recorder.scalar_calls if "logp_grad_norm" in call
+    ]
+    assert len(per_minibatch_calls) == 2
+    assert all("logp_grad_absmax" not in call for call in per_minibatch_calls)
+    max_calls = [call for call in recorder.scalar_calls if "logp_grad_absmax" in call]
+    assert max_calls == [{"logp_grad_absmax": 4.0}]
+    assert all(
+        kwargs.get("collect_logprob_grad_stats") is True
+        for kwargs in actor.engine.train_batch_kwargs
+    )

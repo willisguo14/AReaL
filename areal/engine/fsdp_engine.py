@@ -59,6 +59,7 @@ from areal.api import (
 from areal.api.cli_args import OptimizerConfig, PerfTracerConfig, TrainEngineConfig
 from areal.api.io_struct import DeviceRuntimeInfo
 from areal.engine.core import (
+    LogprobGradAccumulator,
     aggregate_eval_losses,
     compute_total_loss_weight,
     reorder_and_pad_outputs,
@@ -785,6 +786,7 @@ class FSDPEngine(TrainEngine):
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
         optimizer_step_scale: float = 1.0,
+        collect_logprob_grad_stats: bool = False,
     ) -> dict[str, float]:
         self._ensure_ready()
         self.optimizer_zero_grad()
@@ -797,6 +799,11 @@ class FSDPEngine(TrainEngine):
         # Step 2: Compute total loss weight
         total_loss_weight = compute_total_loss_weight(
             mb_list, loss_weight_fn, self.dp_group
+        )
+        logprob_grad_accum = (
+            LogprobGradAccumulator(self.device)
+            if collect_logprob_grad_stats and not self.config.is_critic
+            else None
         )
 
         # Step 3: Forward-backward using process_output_fn callback
@@ -811,6 +818,8 @@ class FSDPEngine(TrainEngine):
                 loss_weight_fn,
                 total_loss_weight,
                 loss_multiplier=self.parallel_helper.dp_size,
+                logprob_grad_accumulator=logprob_grad_accum,
+                logprob_grad_loss_multiplier=self.parallel_helper.dp_size,
             )
 
         self.forward_backward_batch(mb_list, process_output, forward_only=False)
@@ -834,6 +843,19 @@ class FSDPEngine(TrainEngine):
         )
         if grad_cos_sim is not None:
             stats["grad_cos_sim"] = float(grad_cos_sim)
+        if logprob_grad_accum is not None:
+            stats.update(
+                logprob_grad_accum.summary(
+                    (
+                        self.world_mesh["dp_sp"].get_group(),
+                        self.parallel_helper.sp_size,
+                    ),
+                    (
+                        self.world_mesh["tp"].get_group(),
+                        self.parallel_helper.tp_size,
+                    ),
+                )
+            )
         stats["num_micro_batches"] = len(mb_list.mbs)
         return stats
 
@@ -2100,6 +2122,8 @@ class FSDPEngine(TrainEngine):
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
         total_loss_weight: torch.Tensor,
         loss_multiplier: float = 1.0,
+        logprob_grad_accumulator: LogprobGradAccumulator | None = None,
+        logprob_grad_loss_multiplier: float | None = None,
     ) -> torch.Tensor:
         """Compute logprobs/entropy and return scaled loss."""
         local_weight = loss_weight_fn(ctx.mb_input)
@@ -2161,6 +2185,17 @@ class FSDPEngine(TrainEngine):
             loss = loss_fn(values, ctx.mb_input)
 
         loss_scale = local_weight / total_loss_weight * loss_multiplier
+        if logprob_grad_accumulator is not None and not self.config.is_critic:
+            logprob_grad_loss_scale = (
+                local_weight
+                / total_loss_weight
+                * (
+                    loss_multiplier
+                    if logprob_grad_loss_multiplier is None
+                    else logprob_grad_loss_multiplier
+                )
+            )
+            logprob_grad_accumulator.add(loss, logprobs, logprob_grad_loss_scale)
         return loss * loss_scale
 
     def _compute_forward_result(
