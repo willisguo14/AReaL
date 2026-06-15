@@ -548,6 +548,8 @@ def ppo_actor_loss_fn(
         approx_kl=(logprobs - proximal_logprobs).detach(),
         clip_mask=clip_mask,
         dual_clip_mask=dual_clip_mask,
+        loss_advantage=torch.where(loss_mask, advantages, 0.0).detach(),
+        loss_mask=loss_mask.detach().bool(),
     )
     if rejection_sampling is not None:
         stat.update(
@@ -629,6 +631,8 @@ def sapo_loss_fn(
         approx_kl=log_ratio.detach(),
         clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool),  # SAPO doesn't clip
         dual_clip_mask=torch.zeros_like(loss_mask, dtype=torch.bool),
+        loss_advantage=torch.where(loss_mask, advantages, 0.0).detach(),
+        loss_mask=loss_mask.detach().bool(),
         # SAPO-specific stats (scaled gates for consistency)
         sapo_soft_gate=soft_gate.detach(),
         sapo_scaled_gate_pos=scaled_gate_pos.detach(),

@@ -136,6 +136,47 @@ def test_grpo_loss_fn_trace_stat_callback_receives_behavior_stats():
     )
 
 
+def test_grpo_loss_fn_trace_stat_callback_receives_loss_advantage_and_entropy():
+    entropy = torch.tensor([[0.25, 0.75, 9.0]])
+    input_data = {
+        "input_ids": torch.tensor([[11, 12, 13]]),
+        "logprobs": torch.zeros(1, 3),
+        "advantages": torch.tensor([[1.0, 3.0, 99.0]]),
+        "loss_mask": torch.tensor([[True, True, False]]),
+        "prox_logp": torch.zeros(1, 3),
+    }
+    captured_stats = []
+
+    with patch("areal.trainer.ppo.actor.stats_tracker") as mock_tracker:
+        mock_tracker.denominator = MagicMock()
+        mock_tracker.stat = MagicMock()
+        mock_tracker.scalar = MagicMock()
+
+        grpo_loss_fn(
+            logprobs=torch.zeros(1, 3),
+            entropy=entropy,
+            input_data=input_data,
+            eps_clip=0.2,
+            eps_clip_higher=None,
+            c_clip=None,
+            importance_sampling_level="sequence",
+            trace_stat_callback=captured_stats.append,
+        )
+
+    assert len(captured_stats) == 1
+    stat = captured_stats[0]
+    torch.testing.assert_close(stat["entropy"], entropy)
+    torch.testing.assert_close(
+        stat["loss_advantage"],
+        torch.tensor([[2.0, 2.0, 0.0]]),
+    )
+    assert stat["loss_mask"].dtype == torch.bool
+    assert torch.equal(
+        stat["loss_mask"],
+        torch.tensor([[True, True, False]]),
+    )
+
+
 def test_critic_loss_fn_uses_full_cu_seqlens_for_n_tokens():
     input_data = {
         "input_ids": torch.tensor([11, 12]),

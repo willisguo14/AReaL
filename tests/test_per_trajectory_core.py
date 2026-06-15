@@ -520,7 +520,7 @@ def test_tracer_explicit_flush_creates_parent_and_writes_sorted_jsonl(tmp_path):
     assert path.read_text(encoding="utf-8") == (expected + "\n")
     assert ": " not in expected
     assert ", " not in expected
-    assert expected.startswith('{"behave_approx_kl_max":')
+    assert expected.startswith('{"advantage_max":')
 
 
 def test_tracer_rejects_non_finite_values(tmp_path):

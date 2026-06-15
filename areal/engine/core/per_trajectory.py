@@ -92,6 +92,10 @@ class PerTrajectoryRecord:
     logprob_infer_mean: float
     reward: float
     response_length: int
+    entropy_mean: float | None = None
+    advantage_min: float | None = None
+    advantage_max: float | None = None
+    advantage_mean: float | None = None
     behave_imp_weight_min: float | None = None
     behave_imp_weight_max: float | None = None
     behave_imp_weight_mean: float | None = None

@@ -840,7 +840,9 @@ def grpo_loss_fn(
         )
 
     if trace_stat_callback is not None:
-        trace_stat_callback(stat)
+        trace_stat = dict(stat)
+        trace_stat["entropy"] = entropy.float()
+        trace_stat_callback(trace_stat)
 
     # Joint Distillation KL Loss
     teacher_logp = input_data.get("teacher_logp")

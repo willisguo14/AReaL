@@ -397,6 +397,9 @@ def test_train_batch_per_trajectory_uses_single_mb_spec_for_sliced_trajectories(
         if loss_stat_callback is not None:
             loss_stat_callback(
                 {
+                    "loss_mask": torch.tensor([[True, True]]),
+                    "entropy": torch.tensor([[0.25, 0.75]]),
+                    "loss_advantage": torch.tensor([[1.0, 3.0]]),
                     "behave_mask": torch.tensor([[True, True]], dtype=torch.bool),
                     "behave_imp_weight": torch.tensor([[1.0, 3.0]]),
                     "behave_approx_kl": torch.tensor([[-0.5, 0.25]]),
@@ -529,6 +532,10 @@ def test_train_batch_per_trajectory_uses_single_mb_spec_for_sliced_trajectories(
     assert [record.grad_norm for record in tracer.records] == [3.5, 3.5]
     assert [record.reward for record in tracer.records] == [1.0, 0.0]
     assert [record.logprob_train_sum for record in tracer.records] == [-1.5, -1.5]
+    assert [record.entropy_mean for record in tracer.records] == [0.5, 0.5]
+    assert [record.advantage_min for record in tracer.records] == [1.0, 1.0]
+    assert [record.advantage_max for record in tracer.records] == [3.0, 3.0]
+    assert [record.advantage_mean for record in tracer.records] == [2.0, 2.0]
     assert [record.behave_imp_weight_min for record in tracer.records] == [1.0, 1.0]
     assert [record.behave_imp_weight_max for record in tracer.records] == [3.0, 3.0]
     assert [record.behave_imp_weight_mean for record in tracer.records] == [2.0, 2.0]

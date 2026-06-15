@@ -1213,6 +1213,8 @@ class MegatronEngine(TrainEngine):
 
                 train_logprob_sum = 0.0
                 train_response_length = 0
+                entropy_accum = MaskedTensorAccumulator()
+                advantage_accum = MaskedTensorAccumulator()
                 behave_imp_weight_accum = MaskedTensorAccumulator()
                 behave_approx_kl_accum = MaskedTensorAccumulator()
 
@@ -1229,15 +1231,23 @@ class MegatronEngine(TrainEngine):
                     train_response_length += summary.length
 
                 def capture_loss_stats(stat: dict[str, Any]) -> None:
+                    loss_stat_mask = stat.get("loss_mask")
+                    if isinstance(loss_stat_mask, torch.Tensor):
+                        entropy = stat.get("entropy")
+                        if isinstance(entropy, torch.Tensor):
+                            entropy_accum.add(entropy, loss_stat_mask)
+                        loss_advantage = stat.get("loss_advantage")
+                        if isinstance(loss_advantage, torch.Tensor):
+                            advantage_accum.add(loss_advantage, loss_stat_mask)
+
                     behave_mask = stat.get("behave_mask")
-                    if not isinstance(behave_mask, torch.Tensor):
-                        return
-                    behave_imp_weight = stat.get("behave_imp_weight")
-                    if isinstance(behave_imp_weight, torch.Tensor):
-                        behave_imp_weight_accum.add(behave_imp_weight, behave_mask)
-                    behave_approx_kl = stat.get("behave_approx_kl")
-                    if isinstance(behave_approx_kl, torch.Tensor):
-                        behave_approx_kl_accum.add(behave_approx_kl, behave_mask)
+                    if isinstance(behave_mask, torch.Tensor):
+                        behave_imp_weight = stat.get("behave_imp_weight")
+                        if isinstance(behave_imp_weight, torch.Tensor):
+                            behave_imp_weight_accum.add(behave_imp_weight, behave_mask)
+                        behave_approx_kl = stat.get("behave_approx_kl")
+                        if isinstance(behave_approx_kl, torch.Tensor):
+                            behave_approx_kl_accum.add(behave_approx_kl, behave_mask)
 
                 def process_output(
                     output: torch.Tensor,
@@ -1283,6 +1293,8 @@ class MegatronEngine(TrainEngine):
                     traj_batch["rollout_logprobs"],
                     traj_batch.get("rollout_loss_mask", traj_batch["loss_mask"]),
                 )
+                entropy_summary = entropy_accum.summary()
+                advantage_summary = advantage_accum.summary()
                 behave_imp_weight_summary = behave_imp_weight_accum.summary()
                 behave_approx_kl_summary = behave_approx_kl_accum.summary()
                 trainer_global_step = self._extract_scalar_from_batch(
@@ -1312,6 +1324,10 @@ class MegatronEngine(TrainEngine):
                         logprob_infer_mean=rollout_summary.mean,
                         reward=self._reward_from_batch(traj_batch),
                         response_length=rollout_summary.length,
+                        entropy_mean=entropy_summary.mean,
+                        advantage_min=advantage_summary.min,
+                        advantage_max=advantage_summary.max,
+                        advantage_mean=advantage_summary.mean,
                         behave_imp_weight_min=behave_imp_weight_summary.min,
                         behave_imp_weight_max=behave_imp_weight_summary.max,
                         behave_imp_weight_mean=behave_imp_weight_summary.mean,
