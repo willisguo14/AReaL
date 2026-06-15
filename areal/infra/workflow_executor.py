@@ -244,6 +244,35 @@ class _RolloutResult:
     trajectory: dict[str, Any]
 
 
+def _trajectory_num_samples(traj: dict[str, Any]) -> int | None:
+    input_ids = traj.get("input_ids")
+    if isinstance(input_ids, torch.Tensor) and input_ids.ndim >= 1:
+        return int(input_ids.shape[0])
+
+    return None
+
+
+def _valid_traj_uids(value: Any, num_samples: int) -> list[str] | None:
+    if isinstance(value, list) and len(value) == num_samples:
+        result = [str(item) for item in value]
+        return result if all(result) else None
+
+    return None
+
+
+def ensure_trajectory_uids(traj: dict[str, Any], task_id: int) -> None:
+    num_samples = _trajectory_num_samples(traj)
+    if num_samples is None or num_samples <= 0:
+        return
+
+    existing = _valid_traj_uids(traj.get("traj_uid"), num_samples)
+    if existing is not None:
+        traj["traj_uid"] = existing
+        return
+
+    traj["traj_uid"] = [f"{task_id}:{sample_idx}" for sample_idx in range(num_samples)]
+
+
 # Batch size for fetching from the async task runner
 _MAX_FETCH_BATCH_SIZE = 100
 # Timeout for shutting down threads
@@ -969,11 +998,13 @@ class WorkflowExecutor:
         await aiofiles.os.makedirs(version_dir, exist_ok=True)
 
         # Handle batched trajectories
-        batch_size = input_ids.shape[0]
+        num_samples = input_ids.shape[0]
+        ensure_trajectory_uids(traj, task_id)
+        traj_uids = traj["traj_uid"]
 
         file_path = os.path.join(version_dir, f"{task_id}.jsonl")
         async with aiofiles.open(file_path, "a") as f:
-            for i in range(batch_size):
+            for i in range(num_samples):
                 seqlen = attention_mask[i].sum().item()
                 if seqlen == 0:
                     continue
@@ -998,6 +1029,7 @@ class WorkflowExecutor:
                 record = {
                     "task_id": task_id,
                     "sample_idx": i,
+                    "traj_uid": traj_uids[i],
                     "seqlen": seqlen,
                     "prompt_len": prompt_end,
                     "head_version": head_version,
@@ -1143,6 +1175,9 @@ class WorkflowExecutor:
                     self.inference_engine, pending_task.data
                 )
 
+                if isinstance(traj, dict):
+                    ensure_trajectory_uids(traj, task_id)
+
                 # Trajectory format checking
                 if self.config.check_trajectory_format and traj is not None:
                     check_trajectory_format(
@@ -1174,6 +1209,9 @@ class WorkflowExecutor:
                         traj = concat_string_interactions(traj)
 
                 assert traj is None or isinstance(traj, dict), traj
+
+                if traj is not None:
+                    ensure_trajectory_uids(traj, task_id)
 
                 if traj is None:
                     should_accept_traj = False
