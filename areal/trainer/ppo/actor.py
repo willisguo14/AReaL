@@ -17,6 +17,7 @@ from areal.experimental.training_service.controller.controller import (
 from areal.infra import TrainController
 from areal.infra.rpc.serialization import serialize_value
 from areal.trainer.ppo.ess import (
+    compute_sequence_behavior_metrics,
     compute_sequence_ess,
     compute_token_ess,
     summarize_ess_lr_scale_stats,
@@ -597,6 +598,21 @@ class PPOActor:
                 if should_compute_ess:
                     prox_logp, logprobs, loss_mask = _ess_tensors_on_collective_device(
                         mb, ess_collective_device
+                    )
+                    sequence_behavior_metrics = compute_sequence_behavior_metrics(
+                        prox_logp=prox_logp,
+                        logprobs=logprobs,
+                        loss_mask=loss_mask,
+                    )
+                    stats_tracker.denominator(
+                        n_valid_seqs=sequence_behavior_metrics.valid_mask
+                    )
+                    stats_tracker.stat(
+                        behave_seq_log_weight=sequence_behavior_metrics.log_weight,
+                        behave_seq_mean_log_ratio=(
+                            sequence_behavior_metrics.mean_log_ratio
+                        ),
+                        denominator="n_valid_seqs",
                     )
                     sequence_ess_stat = compute_sequence_ess(
                         prox_logp=prox_logp,

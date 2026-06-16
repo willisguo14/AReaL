@@ -18,6 +18,13 @@ class ESSStats:
     valid_count: int
 
 
+@dataclass(frozen=True)
+class SequenceBehaviorMetrics:
+    log_weight: torch.Tensor
+    mean_log_ratio: torch.Tensor
+    valid_mask: torch.Tensor
+
+
 def _should_all_reduce(process_group: Any) -> bool:
     return process_group is not None and dist.is_available() and dist.is_initialized()
 
@@ -78,6 +85,24 @@ def _validate_ess_level(level: str) -> None:
         raise ValueError(f"level must be one of 'sequence' or 'token'; got {level!r}")
 
 
+def _masked_token_log_ratio(
+    prox_logp: torch.Tensor,
+    logprobs: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    _validate_ess_tensor_shapes(prox_logp, logprobs, loss_mask)
+
+    loss_mask = loss_mask.bool()
+    token_log_ratio = prox_logp.float() - logprobs.float()
+    token_log_ratio = torch.where(
+        torch.isfinite(token_log_ratio),
+        token_log_ratio,
+        torch.zeros_like(token_log_ratio),
+    )
+
+    return token_log_ratio.masked_fill(~loss_mask, 0.0), loss_mask
+
+
 def _compute_ess(
     *,
     level: str,
@@ -87,17 +112,8 @@ def _compute_ess(
     scaling_config: Any | None = None,
     process_group: Any | None = None,
 ) -> ESSStats | None:
-    _validate_ess_tensor_shapes(prox_logp, logprobs, loss_mask)
     _validate_ess_level(level)
-
-    loss_mask = loss_mask.bool()
-    token_log_ratio = prox_logp.float() - logprobs.float()
-    token_log_ratio = torch.where(
-        torch.isfinite(token_log_ratio),
-        token_log_ratio,
-        torch.zeros_like(token_log_ratio),
-    )
-    token_log_ratio = token_log_ratio.masked_fill(~loss_mask, 0.0)
+    token_log_ratio, loss_mask = _masked_token_log_ratio(prox_logp, logprobs, loss_mask)
 
     if level == "sequence":
         valid_item_mask = loss_mask.any(dim=-1)
@@ -191,6 +207,29 @@ def compute_token_ess(
         loss_mask=loss_mask,
         scaling_config=scaling_config,
         process_group=process_group,
+    )
+
+
+def compute_sequence_behavior_metrics(
+    *,
+    prox_logp: torch.Tensor,
+    logprobs: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> SequenceBehaviorMetrics:
+    token_log_ratio, loss_mask = _masked_token_log_ratio(prox_logp, logprobs, loss_mask)
+
+    valid_mask = loss_mask.any(dim=-1)
+    valid_token_count = loss_mask.sum(dim=-1).clamp(min=1)
+    log_weight = token_log_ratio.sum(dim=-1)
+    mean_log_ratio = log_weight / valid_token_count.to(dtype=log_weight.dtype)
+
+    log_weight = torch.where(valid_mask, log_weight, 0.0).float()
+    mean_log_ratio = torch.where(valid_mask, mean_log_ratio, 0.0).float()
+
+    return SequenceBehaviorMetrics(
+        log_weight=log_weight,
+        mean_log_ratio=mean_log_ratio,
+        valid_mask=valid_mask,
     )
 
 

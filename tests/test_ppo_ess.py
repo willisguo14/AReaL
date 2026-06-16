@@ -12,6 +12,7 @@ from areal.trainer.ppo import actor as actor_module
 from areal.trainer.ppo.actor import PPOActor
 from areal.trainer.ppo.ess import (
     ESSStats,
+    compute_sequence_behavior_metrics,
     compute_sequence_ess,
     compute_token_ess,
     summarize_ess_lr_scale_stats,
@@ -259,6 +260,40 @@ def test_compute_sequence_ess_uses_full_sequence_sum():
     assert stats.ess_ratio == pytest.approx(1.0)
 
 
+def test_compute_sequence_behavior_metrics_uses_valid_sequence_values():
+    logprobs = torch.zeros((3, 3))
+    prox_logp = torch.tensor(
+        [
+            [math.log(2.0), math.log(3.0), 99.0],
+            [math.log(4.0), 0.0, 0.0],
+            [10.0, 20.0, 30.0],
+        ]
+    )
+    loss_mask = torch.tensor(
+        [
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0],
+        ]
+    )
+
+    metrics = compute_sequence_behavior_metrics(
+        prox_logp=prox_logp,
+        logprobs=logprobs,
+        loss_mask=loss_mask,
+    )
+
+    assert torch.equal(metrics.valid_mask, torch.tensor([True, True, False]))
+    torch.testing.assert_close(
+        metrics.log_weight,
+        torch.tensor([math.log(6.0), math.log(4.0), 0.0]),
+    )
+    torch.testing.assert_close(
+        metrics.mean_log_ratio,
+        torch.tensor([math.log(6.0) / 2.0, math.log(4.0) / 3.0, 0.0]),
+    )
+
+
 def test_compute_sequence_ess_excludes_empty_sequences():
     logprobs = torch.zeros((2, 2))
     prox_logp = torch.zeros_like(logprobs)
@@ -305,6 +340,22 @@ def test_compute_sequence_ess_sanitizes_nonfinite_token_ratios():
     assert math.isfinite(stats.ess)
     assert math.isfinite(stats.ess_ratio)
     assert math.isfinite(stats.ess_lr_scale)
+
+
+def test_compute_sequence_behavior_metrics_sanitizes_nonfinite_token_ratios():
+    logprobs = torch.tensor([[0.0, float("-inf"), 0.0]])
+    prox_logp = torch.tensor([[float("inf"), 0.0, float("nan")]])
+    loss_mask = torch.ones_like(logprobs)
+
+    metrics = compute_sequence_behavior_metrics(
+        prox_logp=prox_logp,
+        logprobs=logprobs,
+        loss_mask=loss_mask,
+    )
+
+    assert torch.equal(metrics.valid_mask, torch.tensor([True]))
+    torch.testing.assert_close(metrics.log_weight, torch.tensor([0.0]))
+    torch.testing.assert_close(metrics.mean_log_ratio, torch.tensor([0.0]))
 
 
 def test_summarize_ess_stats_returns_level_named_avg_min_max():
@@ -360,13 +411,15 @@ def test_summarize_ess_lr_scale_stats_returns_avg_min_max():
 
 class _StatsRecorder:
     def __init__(self):
+        self.denominator_calls = []
+        self.stat_calls = []
         self.scalar_calls = []
 
     def denominator(self, **kwargs):
-        pass
+        self.denominator_calls.append(kwargs)
 
     def stat(self, **kwargs):
-        pass
+        self.stat_calls.append(kwargs)
 
     def scalar(self, **kwargs):
         self.scalar_calls.append(kwargs)
@@ -522,6 +575,13 @@ def _scalar_call_with(recorder, key):
     return matches[0]
 
 
+def _stat_call_with(recorder, key):
+    for call in recorder.stat_calls:
+        if key in call:
+            return call
+    raise AssertionError(f"No stat call contained {key!r}: {recorder.stat_calls}")
+
+
 def test_ess_collective_device_uses_engine_device_for_non_cpu_backend(monkeypatch):
     monkeypatch.setattr(
         actor_module,
@@ -608,6 +668,36 @@ def test_ppo_update_logs_sequence_and_token_ess_metrics_without_scaling(monkeypa
     keys = _scalar_keys(recorder)
     assert not any(key.startswith("ess_lr_scale/") for key in keys)
     assert not any(key.startswith("ess_lr/") for key in keys)
+
+
+def test_ppo_update_logs_sequence_behavior_metrics_with_sequence_denominator(
+    monkeypatch,
+):
+    recorder = _StatsRecorder()
+    minibatches = [_multi_token_skewed_minibatch()]
+    _patch_actor_update_fakes(monkeypatch, recorder, minibatches)
+    actor = _make_actor([{"loss": 1.0}], ess_scaling=None)
+
+    actor._ppo_update(_make_data())
+
+    stat_call = _stat_call_with(recorder, "behave_seq_log_weight")
+    assert stat_call["denominator"] == "n_valid_seqs"
+    torch.testing.assert_close(
+        stat_call["behave_seq_log_weight"],
+        torch.tensor([math.log(9.0), 0.0]),
+    )
+    torch.testing.assert_close(
+        stat_call["behave_seq_mean_log_ratio"],
+        torch.tensor([math.log(9.0) / 2.0, 0.0]),
+    )
+
+    denominator_call = next(
+        call for call in recorder.denominator_calls if "n_valid_seqs" in call
+    )
+    assert torch.equal(
+        denominator_call["n_valid_seqs"],
+        torch.tensor([True, True]),
+    )
 
 
 def test_ppo_update_sequence_scaling_uses_sequence_ess_by_default(monkeypatch):
