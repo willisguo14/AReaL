@@ -71,6 +71,13 @@ class LogprobGradAccumulator:
         self._sum_sq += torch.sum(grad * grad)
         self._abs_max = torch.maximum(self._abs_max, grad.abs().max())
 
+    def merge(self, other: "LogprobGradAccumulator") -> None:
+        self._sum_sq += other._sum_sq.detach().to(device=self._sum_sq.device)
+        self._abs_max = torch.maximum(
+            self._abs_max,
+            other._abs_max.detach().to(device=self._abs_max.device),
+        )
+
     def summary(
         self,
         *groups: tuple[dist.ProcessGroup | None, float] | dist.ProcessGroup | None,

@@ -13,13 +13,25 @@ def test_per_trajectory_config_defaults_disabled():
 
     assert config.enabled is False
     assert config.flush_threshold == 256
+    assert config.max_grad_norm is None
 
 
 def test_per_trajectory_config_accepts_enabled():
-    config = PerTrajectoryConfig(enabled=True, flush_threshold=8)
+    config = PerTrajectoryConfig(
+        enabled=True,
+        flush_threshold=8,
+        max_grad_norm=3.5,
+    )
 
     assert config.enabled is True
     assert config.flush_threshold == 8
+    assert config.max_grad_norm == 3.5
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0])
+def test_per_trajectory_config_rejects_non_positive_grad_norm_filter(value):
+    with pytest.raises(ValueError, match="max_grad_norm"):
+        PerTrajectoryConfig(max_grad_norm=value)
 
 
 def test_actor_config_accepts_disabled_per_trajectory_with_defaults():

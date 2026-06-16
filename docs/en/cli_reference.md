@@ -1132,10 +1132,11 @@ entries for torch.cuda.memory.\_record_memory_history.
 
 Configuration for exact per-trajectory actor gradient tracing.
 
-| Parameter         | Type    | Default | Description                                                                                          |
-| ----------------- | ------- | ------- | ---------------------------------------------------------------------------------------------------- |
-| `enabled`         | boolean | `False` | Enable exact per-trajectory actor gradient tracing.                                                  |
-| `flush_threshold` | integer | `256`   | Flush per-trajectory JSONL records once this many entries are buffered. Values \<= 0 fall back to 1. |
+| Parameter         | Type          | Default | Description                                                                                                              |
+| ----------------- | ------------- | ------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `enabled`         | boolean       | `False` | Enable exact per-trajectory actor gradient tracing.                                                                      |
+| `flush_threshold` | integer       | `256`   | Flush per-trajectory JSONL records once this many entries are buffered. Values \<= 0 fall back to 1.                     |
+| `max_grad_norm`   | float \| None | `None`  | Drop per-trajectory gradients whose traced grad_norm exceeds this positive threshold. None disables grad-norm filtering. |
 
 (section-perf-tracer)=
 

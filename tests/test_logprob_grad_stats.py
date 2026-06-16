@@ -3,7 +3,11 @@ import math
 import pytest
 import torch
 
-from areal.engine.core import LogprobGradAccumulator
+from areal.engine.core import (
+    LOGP_GRAD_ABSMAX_KEY,
+    LOGP_GRAD_NORM_KEY,
+    LogprobGradAccumulator,
+)
 from areal.utils.functional import ppo_actor_loss_fn
 
 
@@ -90,3 +94,48 @@ def test_logprob_grad_accumulator_sums_squares_across_microbatches():
     assert split_stats["logp_grad_absmax"] == pytest.approx(
         float((weights / total_weight).abs().max())
     )
+
+
+def test_logprob_grad_accumulator_merge_combines_sums_and_absmax():
+    first = LogprobGradAccumulator("cpu")
+    second = LogprobGradAccumulator("cpu")
+    merged = LogprobGradAccumulator("cpu")
+
+    first_logprobs = torch.tensor(
+        [0.2, -0.1],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    second_logprobs = torch.tensor(
+        [0.7, -0.3],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+
+    first.add(
+        (first_logprobs * torch.tensor([1.0, -2.0])).sum(),
+        first_logprobs,
+        0.5,
+    )
+    second.add(
+        (second_logprobs * torch.tensor([3.0, -4.0])).sum(),
+        second_logprobs,
+        0.25,
+    )
+
+    first_stats = first.summary()
+    second_stats = second.summary()
+
+    merged.merge(first)
+    merged.merge(second)
+    merged_stats = merged.summary()
+
+    expected_norm = math.sqrt(
+        first_stats[LOGP_GRAD_NORM_KEY] ** 2 + second_stats[LOGP_GRAD_NORM_KEY] ** 2
+    )
+    expected_absmax = max(
+        first_stats[LOGP_GRAD_ABSMAX_KEY],
+        second_stats[LOGP_GRAD_ABSMAX_KEY],
+    )
+    assert merged_stats[LOGP_GRAD_NORM_KEY] == pytest.approx(expected_norm)
+    assert merged_stats[LOGP_GRAD_ABSMAX_KEY] == pytest.approx(expected_absmax)

@@ -39,6 +39,23 @@ def _record(**overrides):
     return PerTrajectoryRecord(**values)
 
 
+def test_per_trajectory_record_defaults_grad_norm_filtered_false():
+    record = _record()
+
+    assert record.grad_norm_filtered is False
+    assert asdict(record)["grad_norm_filtered"] is False
+
+
+def test_tracer_writes_grad_norm_filtered_flag(tmp_path):
+    path = tmp_path / "trace.jsonl"
+    tracer = PerTrajectoryTracer(path=path, flush_threshold=1, enabled=True)
+
+    tracer.write(_record(grad_norm_filtered=True))
+
+    row = json.loads(path.read_text(encoding="utf-8"))
+    assert row["grad_norm_filtered"] is True
+
+
 def test_normalize_flush_threshold_falls_back_to_one():
     assert normalize_flush_threshold(0) == 1
     assert normalize_flush_threshold(-5) == 1

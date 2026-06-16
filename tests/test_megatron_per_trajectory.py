@@ -227,7 +227,11 @@ def _engine_stub(**overrides):
         use_lora=False,
         experiment_name="exp",
         trial_name="trial",
-        per_trajectory=SimpleNamespace(enabled=True, flush_threshold=256),
+        per_trajectory=SimpleNamespace(
+            enabled=True,
+            flush_threshold=256,
+            max_grad_norm=None,
+        ),
     )
     engine.parallel_strategy = SimpleNamespace(
         pipeline_parallel_size=1,
@@ -324,6 +328,211 @@ class _FakePerTrajectoryTracer:
 
     def close(self):
         self.closed = True
+
+
+def _make_per_trajectory_input(torch):
+    return {
+        "input_ids": torch.tensor([[1, 2], [3, 4]]),
+        "attention_mask": torch.ones(2, 2, dtype=torch.bool),
+        "loss_mask": torch.tensor([[False, True], [False, True]]),
+        "rollout_logprobs": torch.tensor([[-0.1, -0.2], [-0.3, -0.4]]),
+        "rollout_loss_mask": torch.tensor([[False, True], [False, True]]),
+        "task_reward": torch.tensor([1.0, 0.0]),
+        "trainer_global_step": torch.tensor([9, 9]),
+        "trainer_fileroot": "/tmp/unused",
+        "uid": ["traj-a", "traj-b"],
+    }
+
+
+def _setup_per_trajectory_filter_fixture(
+    monkeypatch,
+    *,
+    grad_norms,
+    max_grad_norm=3.0,
+):
+    torch = megatron_engine.torch
+    mb_spec = megatron_engine.MicroBatchSpec(
+        n_mbs=2,
+        max_tokens_per_mb=128,
+        packing_algorithm="kk",
+    )
+    engine = _engine_stub()
+    engine.config.mb_spec = mb_spec
+    engine.config.per_trajectory.max_grad_norm = max_grad_norm
+    engine.config.pad_to_maximum = False
+    engine.device = torch.device("cpu")
+    engine.is_offload = False
+    engine.optimizer = _FakeOptimizer()
+    engine.optimizer.param_groups = [{"lr": 0.01}]
+    engine.grad_cosine_tracker = _FakeGradCosineTracker()
+    engine._cached_duplicated_param_names = set()
+    tracer = _FakePerTrajectoryTracer()
+    events = []
+    grad_norm_iter = iter(grad_norms)
+    input_batched = _make_per_trajectory_input(torch)
+
+    def fake_prepare_mb_list(input_, mb_spec=None):
+        effective_spec = mb_spec or engine.config.mb_spec
+        if int(input_["attention_mask"].shape[0]) == 1:
+            mbs = [{"loss_mask": input_["loss_mask"]}]
+        else:
+            mbs = [
+                {"loss_mask": input_["loss_mask"]} for _ in range(effective_spec.n_mbs)
+            ]
+        return _FakeMicroBatchList(mbs)
+
+    def fake_forward_backward_batch(mb_list, process_output, forward_only=False):
+        events.append(("forward_backward", len(mb_list), forward_only))
+        for mb in mb_list.mbs:
+            output = torch.zeros_like(mb["loss_mask"], dtype=torch.float32)
+            process_output(output, mb)
+
+    def fake_compute_logprobs_and_loss(
+        output,
+        inputs,
+        loss_fn,
+        loss_weight_fn,
+        total_loss_weight,
+        *,
+        loss_multiplier=1.0,
+        logprob_callback=None,
+        loss_stat_callback=None,
+        logprob_grad_accumulator=None,
+        logprob_grad_loss_multiplier=None,
+    ):
+        events.append(
+            (
+                "loss",
+                float(loss_multiplier),
+                logprob_grad_accumulator is not None,
+                logprob_grad_loss_multiplier,
+            )
+        )
+        if logprob_callback is not None:
+            logprob_callback(
+                torch.tensor([[-0.5, -1.5]], dtype=torch.float32),
+                inputs,
+            )
+        if loss_stat_callback is not None:
+            loss_stat_callback(
+                {
+                    "loss_mask": torch.tensor([[True, True]]),
+                    "entropy": torch.tensor([[0.25, 0.75]]),
+                    "loss_advantage": torch.tensor([[1.0, 3.0]]),
+                    "behave_mask": torch.tensor([[True, True]], dtype=torch.bool),
+                    "behave_imp_weight": torch.tensor([[1.0, 3.0]]),
+                    "behave_approx_kl": torch.tensor([[-0.5, 0.25]]),
+                }
+            )
+        if logprob_grad_accumulator is not None:
+            logprobs = torch.tensor(
+                [[0.1, 0.2]],
+                dtype=torch.float32,
+                requires_grad=True,
+            )
+            logprob_grad_accumulator.add(logprobs.sum(), logprobs, 1.0)
+        return output.sum()
+
+    monkeypatch.setattr(engine, "_prepare_mb_list", fake_prepare_mb_list)
+    monkeypatch.setattr(engine, "forward_backward_batch", fake_forward_backward_batch)
+    monkeypatch.setattr(
+        engine,
+        "_compute_logprobs_and_loss",
+        fake_compute_logprobs_and_loss,
+    )
+    monkeypatch.setattr(
+        engine,
+        "optimizer_zero_grad",
+        lambda: events.append(("zero_grad",)),
+    )
+    monkeypatch.setattr(
+        engine,
+        "optimizer_step",
+        lambda: events.append(("optimizer_step",))
+        or {"update_successful": 1.0, "grad_norm": 5.0, "lr": 0.01},
+    )
+    monkeypatch.setattr(engine, "_make_per_trajectory_tracer", lambda _input: tracer)
+    monkeypatch.setattr(
+        megatron_engine,
+        "compute_total_loss_weight",
+        lambda mb_list, loss_weight_fn, group: torch.tensor(2.0),
+    )
+    monkeypatch.setattr(
+        megatron_engine,
+        "allocate_grad_accum_buffers",
+        lambda model: events.append(("allocate",)) or ["accum"],
+    )
+    monkeypatch.setattr(
+        megatron_engine,
+        "zero_grad_accum_buffers",
+        lambda buffers: events.append(("zero_accum", tuple(buffers))),
+    )
+    monkeypatch.setattr(
+        megatron_engine,
+        "accumulate_grad_buffers",
+        lambda model, buffers: events.append(("accumulate", tuple(buffers))),
+    )
+    monkeypatch.setattr(
+        megatron_engine,
+        "copy_accum_buffers_to_grad_buffers",
+        lambda model, buffers: events.append(("copy_back", tuple(buffers))),
+    )
+    monkeypatch.setattr(
+        megatron_engine,
+        "grad_norm_from_model_parallel_stats",
+        lambda **kwargs: next(grad_norm_iter),
+    )
+    monkeypatch.setattr(
+        megatron_engine,
+        "finish_dp_grad_sync",
+        lambda model: events.append(("finish_dp_sync",)),
+    )
+    monkeypatch.setattr(
+        megatron_engine,
+        "restore_dp_sync",
+        lambda model, state: events.append(("restore_dp_sync", state)),
+    )
+    monkeypatch.setattr(
+        megatron_engine.mpu,
+        "get_data_parallel_group",
+        lambda *args, **kwargs: "dp-group",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        megatron_engine.mpu,
+        "get_data_parallel_world_size",
+        lambda *args, **kwargs: 1,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        megatron_engine.mpu,
+        "get_tensor_model_parallel_group",
+        lambda *args, **kwargs: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        megatron_engine.mpu,
+        "get_tensor_model_parallel_world_size",
+        lambda *args, **kwargs: 1,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        megatron_engine.dist,
+        "get_world_size",
+        lambda group=None: 1,
+    )
+    return engine, input_batched, tracer, events
+
+
+def _train_per_trajectory_fixture(engine, input_batched, *, collect_logprob=False):
+    torch = megatron_engine.torch
+    return engine.train_batch_per_trajectory(
+        input_batched,
+        loss_fn=lambda *args, **kwargs: torch.tensor(0.0),
+        loss_weight_fn=lambda mb: mb["loss_mask"].count_nonzero(),
+        minibatch_idx=4,
+        collect_logprob_grad_stats=collect_logprob,
+    )
 
 
 def test_train_batch_per_trajectory_uses_single_mb_spec_for_sliced_trajectories(
@@ -530,6 +739,7 @@ def test_train_batch_per_trajectory_uses_single_mb_spec_for_sliced_trajectories(
     assert tracer.closed is True
     assert [record.trajectory_id for record in tracer.records] == ["traj-a", "traj-b"]
     assert [record.grad_norm for record in tracer.records] == [3.5, 3.5]
+    assert [record.grad_norm_filtered for record in tracer.records] == [False, False]
     assert [record.reward for record in tracer.records] == [1.0, 0.0]
     assert [record.logprob_train_sum for record in tracer.records] == [-1.5, -1.5]
     assert [record.entropy_mean for record in tracer.records] == [0.5, 0.5]
@@ -547,6 +757,293 @@ def test_train_batch_per_trajectory_uses_single_mb_spec_for_sliced_trajectories(
     ]
     assert stats["num_micro_batches"] == 3
     assert stats["grad_cos_sim"] == pytest.approx(0.25)
+    assert "grad_norm_filter_count" not in stats
+    assert "grad_norm_filter_fraction" not in stats
+
+
+def test_train_batch_per_trajectory_filters_over_threshold_grad_norm(monkeypatch):
+    torch = megatron_engine.torch
+    mb_spec = megatron_engine.MicroBatchSpec(
+        n_mbs=2,
+        max_tokens_per_mb=128,
+        packing_algorithm="kk",
+    )
+    engine = _engine_stub()
+    engine.config.mb_spec = mb_spec
+    engine.config.per_trajectory.max_grad_norm = 3.0
+    engine.config.pad_to_maximum = False
+    engine.device = torch.device("cpu")
+    engine.is_offload = False
+    engine.optimizer = _FakeOptimizer()
+    engine.grad_cosine_tracker = _FakeGradCosineTracker()
+    engine._cached_duplicated_param_names = set()
+    tracer = _FakePerTrajectoryTracer()
+
+    events = []
+    grad_norms = iter([2.0, 5.0])
+    input_batched = {
+        "input_ids": torch.tensor([[1, 2], [3, 4]]),
+        "attention_mask": torch.ones(2, 2, dtype=torch.bool),
+        "loss_mask": torch.tensor([[False, True], [False, True]]),
+        "rollout_logprobs": torch.tensor([[-0.1, -0.2], [-0.3, -0.4]]),
+        "rollout_loss_mask": torch.tensor([[False, True], [False, True]]),
+        "task_reward": torch.tensor([1.0, 0.0]),
+        "trainer_global_step": torch.tensor([9, 9]),
+        "trainer_fileroot": "/tmp/unused",
+        "uid": ["traj-a", "traj-b"],
+    }
+
+    def fake_prepare_mb_list(input_, mb_spec=None):
+        effective_spec = mb_spec or engine.config.mb_spec
+        if int(input_["attention_mask"].shape[0]) == 1:
+            mbs = [{"loss_mask": input_["loss_mask"]}]
+        else:
+            mbs = [
+                {"loss_mask": input_["loss_mask"]} for _ in range(effective_spec.n_mbs)
+            ]
+        return _FakeMicroBatchList(mbs)
+
+    def fake_forward_backward_batch(mb_list, process_output, forward_only=False):
+        events.append(("forward_backward", len(mb_list), forward_only))
+        for mb in mb_list.mbs:
+            output = torch.zeros_like(mb["loss_mask"], dtype=torch.float32)
+            process_output(output, mb)
+
+    def fake_compute_logprobs_and_loss(
+        output,
+        inputs,
+        loss_fn,
+        loss_weight_fn,
+        total_loss_weight,
+        *,
+        loss_multiplier=1.0,
+        logprob_callback=None,
+        loss_stat_callback=None,
+        logprob_grad_accumulator=None,
+        logprob_grad_loss_multiplier=None,
+    ):
+        events.append(
+            (
+                "loss",
+                float(loss_multiplier),
+                logprob_grad_accumulator is not None,
+                logprob_grad_loss_multiplier,
+            )
+        )
+        if logprob_callback is not None:
+            logprob_callback(
+                torch.tensor([[-0.5, -1.5]], dtype=torch.float32),
+                inputs,
+            )
+        if loss_stat_callback is not None:
+            loss_stat_callback(
+                {
+                    "loss_mask": torch.tensor([[True, True]]),
+                    "entropy": torch.tensor([[0.25, 0.75]]),
+                    "loss_advantage": torch.tensor([[1.0, 3.0]]),
+                    "behave_mask": torch.tensor([[True, True]], dtype=torch.bool),
+                    "behave_imp_weight": torch.tensor([[1.0, 3.0]]),
+                    "behave_approx_kl": torch.tensor([[-0.5, 0.25]]),
+                }
+            )
+        if logprob_grad_accumulator is not None:
+            logprobs = torch.tensor(
+                [[0.1, 0.2]],
+                dtype=torch.float32,
+                requires_grad=True,
+            )
+            logprob_grad_accumulator.add(logprobs.sum(), logprobs, 1.0)
+        return output.sum()
+
+    monkeypatch.setattr(engine, "_prepare_mb_list", fake_prepare_mb_list)
+    monkeypatch.setattr(engine, "forward_backward_batch", fake_forward_backward_batch)
+    monkeypatch.setattr(
+        engine,
+        "_compute_logprobs_and_loss",
+        fake_compute_logprobs_and_loss,
+    )
+    monkeypatch.setattr(
+        engine,
+        "optimizer_zero_grad",
+        lambda: events.append(("zero_grad",)),
+    )
+    monkeypatch.setattr(
+        engine,
+        "optimizer_step",
+        lambda: events.append(("optimizer_step",))
+        or {"update_successful": 1.0, "grad_norm": 5.0, "lr": 0.01},
+    )
+    monkeypatch.setattr(engine, "_make_per_trajectory_tracer", lambda _input: tracer)
+    monkeypatch.setattr(
+        megatron_engine,
+        "compute_total_loss_weight",
+        lambda mb_list, loss_weight_fn, group: torch.tensor(2.0),
+    )
+    monkeypatch.setattr(
+        megatron_engine,
+        "allocate_grad_accum_buffers",
+        lambda model: events.append(("allocate",)) or ["accum"],
+    )
+    monkeypatch.setattr(
+        megatron_engine,
+        "zero_grad_accum_buffers",
+        lambda buffers: events.append(("zero_accum", tuple(buffers))),
+    )
+    monkeypatch.setattr(
+        megatron_engine,
+        "accumulate_grad_buffers",
+        lambda model, buffers: events.append(("accumulate", tuple(buffers))),
+    )
+    monkeypatch.setattr(
+        megatron_engine,
+        "copy_accum_buffers_to_grad_buffers",
+        lambda model, buffers: events.append(("copy_back", tuple(buffers))),
+    )
+    monkeypatch.setattr(
+        megatron_engine,
+        "grad_norm_from_model_parallel_stats",
+        lambda **kwargs: next(grad_norms),
+    )
+    monkeypatch.setattr(
+        megatron_engine,
+        "finish_dp_grad_sync",
+        lambda model: events.append(("finish_dp_sync",)),
+    )
+    monkeypatch.setattr(
+        megatron_engine,
+        "restore_dp_sync",
+        lambda model, state: events.append(("restore_dp_sync", state)),
+    )
+    monkeypatch.setattr(
+        megatron_engine.mpu,
+        "get_data_parallel_group",
+        lambda *args, **kwargs: "dp-group",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        megatron_engine.mpu,
+        "get_data_parallel_world_size",
+        lambda *args, **kwargs: 1,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        megatron_engine.mpu,
+        "get_tensor_model_parallel_group",
+        lambda *args, **kwargs: None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        megatron_engine.mpu,
+        "get_tensor_model_parallel_world_size",
+        lambda *args, **kwargs: 1,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        megatron_engine.dist,
+        "get_world_size",
+        lambda group=None: 1,
+    )
+
+    stats = engine.train_batch_per_trajectory(
+        input_batched,
+        loss_fn=lambda *args, **kwargs: torch.tensor(0.0),
+        loss_weight_fn=lambda mb: mb["loss_mask"].count_nonzero(),
+        minibatch_idx=4,
+        collect_logprob_grad_stats=True,
+    )
+
+    assert [event for event in events if event[0] == "forward_backward"] == [
+        ("forward_backward", 1, False),
+        ("forward_backward", 1, False),
+    ]
+    assert [event for event in events if event[0] == "accumulate"] == [
+        ("accumulate", ("accum",)),
+    ]
+    assert ("copy_back", ("accum",)) in events
+    assert [record.grad_norm for record in tracer.records] == [2.0, 5.0]
+    assert [record.grad_norm_filtered for record in tracer.records] == [False, True]
+    assert stats["grad_norm_filter_count"] == pytest.approx(1.0)
+    assert stats["grad_norm_filter_fraction"] == pytest.approx(0.5)
+    assert stats["logp_grad_norm"] == pytest.approx(math.sqrt(2.0))
+    assert stats["logp_grad_absmax"] == pytest.approx(1.0)
+
+
+def test_train_batch_per_trajectory_all_filtered_skips_optimizer_step(monkeypatch):
+    engine, input_batched, tracer, events = _setup_per_trajectory_filter_fixture(
+        monkeypatch,
+        grad_norms=[5.0, 7.0],
+    )
+
+    stats = _train_per_trajectory_fixture(
+        engine,
+        input_batched,
+        collect_logprob=True,
+    )
+
+    assert [event for event in events if event[0] == "forward_backward"] == [
+        ("forward_backward", 1, False),
+        ("forward_backward", 1, False),
+    ]
+    assert [event for event in events if event[0] == "accumulate"] == []
+    assert [event for event in events if event[0] == "copy_back"] == []
+    assert [event for event in events if event[0] == "optimizer_step"] == []
+    assert engine.grad_cosine_tracker.prepare_calls == []
+    assert engine.grad_cosine_tracker.finalize_calls == []
+    assert [record.grad_norm_filtered for record in tracer.records] == [True, True]
+    assert stats["grad_norm_filter_count"] == pytest.approx(2.0)
+    assert stats["grad_norm_filter_fraction"] == pytest.approx(1.0)
+    assert stats["update_successful"] == pytest.approx(0.0)
+    assert stats["grad_norm"] == pytest.approx(0.0)
+    assert stats["lr"] == pytest.approx(0.01)
+    assert stats["logp_grad_norm"] == pytest.approx(0.0)
+    assert stats["logp_grad_absmax"] == pytest.approx(0.0)
+    assert stats["num_micro_batches"] == 2
+
+
+def test_train_batch_per_trajectory_filters_non_finite_grad_norm(monkeypatch):
+    engine, input_batched, tracer, events = _setup_per_trajectory_filter_fixture(
+        monkeypatch,
+        grad_norms=[float("nan"), 2.0],
+    )
+
+    stats = _train_per_trajectory_fixture(engine, input_batched)
+
+    assert [event for event in events if event[0] == "accumulate"] == [
+        ("accumulate", ("accum",)),
+    ]
+    assert math.isnan(tracer.records[0].grad_norm)
+    assert [record.grad_norm_filtered for record in tracer.records] == [True, False]
+    assert stats["grad_norm_filter_count"] == pytest.approx(1.0)
+    assert stats["grad_norm_filter_fraction"] == pytest.approx(0.5)
+
+
+def test_train_batch_per_trajectory_reports_global_filter_stats(monkeypatch):
+    engine, input_batched, tracer, events = _setup_per_trajectory_filter_fixture(
+        monkeypatch,
+        grad_norms=[2.0, 5.0],
+    )
+    all_reduce_inputs = []
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        all_reduce_inputs.append((tensor.detach().clone(), op, group))
+        tensor[0] = 3.0
+        tensor[1] = 4.0
+
+    monkeypatch.setattr(megatron_engine.dist, "is_available", lambda: True)
+    monkeypatch.setattr(megatron_engine.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(megatron_engine.dist, "all_reduce", fake_all_reduce)
+
+    stats = _train_per_trajectory_fixture(engine, input_batched)
+
+    assert [event for event in events if event[0] == "accumulate"] == [
+        ("accumulate", ("accum",)),
+    ]
+    assert [record.grad_norm_filtered for record in tracer.records] == [False, True]
+    assert len(all_reduce_inputs) == 1
+    assert all_reduce_inputs[0][0].tolist() == [1.0, 2.0]
+    assert all_reduce_inputs[0][2] == "dp-group"
+    assert stats["grad_norm_filter_count"] == pytest.approx(3.0)
+    assert stats["grad_norm_filter_fraction"] == pytest.approx(0.75)
 
 
 def test_validate_per_trajectory_support_accepts_dense_megatron():

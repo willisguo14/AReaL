@@ -1195,6 +1195,8 @@ class MegatronEngine(TrainEngine):
                 n_mbs_divisor=1,
             )
             n_trajectories = int(input_batched["attention_mask"].shape[0])
+            max_grad_norm = getattr(self.config.per_trajectory, "max_grad_norm", None)
+            grad_norm_filter_count = 0
             for trajectory_idx in range(n_trajectories):
                 traj_batch = slice_trajectory(input_batched, trajectory_idx)
                 traj_mb_list = self._prepare_mb_list(
@@ -1217,6 +1219,11 @@ class MegatronEngine(TrainEngine):
                 advantage_accum = MaskedTensorAccumulator()
                 behave_imp_weight_accum = MaskedTensorAccumulator()
                 behave_approx_kl_accum = MaskedTensorAccumulator()
+                trajectory_logprob_grad_accum = (
+                    LogprobGradAccumulator(self.device)
+                    if logprob_grad_accum is not None
+                    else None
+                )
 
                 def capture_logprobs(
                     logprobs: torch.Tensor,
@@ -1254,8 +1261,10 @@ class MegatronEngine(TrainEngine):
                     inputs: dict[str, Any],
                 ) -> torch.Tensor:
                     kwargs: dict[str, Any] = {}
-                    if logprob_grad_accum is not None:
-                        kwargs["logprob_grad_accumulator"] = logprob_grad_accum
+                    if trajectory_logprob_grad_accum is not None:
+                        kwargs["logprob_grad_accumulator"] = (
+                            trajectory_logprob_grad_accum
+                        )
                         kwargs["logprob_grad_loss_multiplier"] = dp_loss_multiplier
                     return self._compute_logprobs_and_loss(
                         output,
@@ -1287,7 +1296,19 @@ class MegatronEngine(TrainEngine):
                     schedule_scale=schedule_scale,
                 )
                 trace_grad_norm = grad_norm / dp_loss_multiplier
-                accumulate_grad_buffers(self.model, accum_buffers)
+                grad_norm_filtered = max_grad_norm is not None and (
+                    not math.isfinite(trace_grad_norm)
+                    or trace_grad_norm > max_grad_norm
+                )
+                if grad_norm_filtered:
+                    grad_norm_filter_count += 1
+                else:
+                    accumulate_grad_buffers(self.model, accum_buffers)
+                    if (
+                        logprob_grad_accum is not None
+                        and trajectory_logprob_grad_accum is not None
+                    ):
+                        logprob_grad_accum.merge(trajectory_logprob_grad_accum)
 
                 rollout_summary = summarize_logprobs(
                     traj_batch["rollout_logprobs"],
@@ -1316,6 +1337,7 @@ class MegatronEngine(TrainEngine):
                         trajectory_idx=trajectory_idx,
                         trajectory_id=trajectory_id,
                         grad_norm=float(trace_grad_norm),
+                        grad_norm_filtered=bool(grad_norm_filtered),
                         logprob_train_sum=float(train_logprob_sum),
                         logprob_train_mean=float(
                             train_logprob_sum / train_response_length
@@ -1338,24 +1360,54 @@ class MegatronEngine(TrainEngine):
                 )
                 self.optimizer_zero_grad()
 
-            copy_accum_buffers_to_grad_buffers(self.model, accum_buffers)
-            if dp_world_size > 1:
-                finish_dp_grad_sync(self.model)
+            if max_grad_norm is not None:
+                filter_stats = torch.tensor(
+                    [float(grad_norm_filter_count), float(n_trajectories)],
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                if dist.is_available() and dist.is_initialized():
+                    dist.all_reduce(filter_stats, op=dist.ReduceOp.SUM, group=dp_group)
+                global_grad_norm_filter_count = float(filter_stats[0].item())
+                global_n_trajectories = float(filter_stats[1].item())
+                global_kept_trajectories = (
+                    global_n_trajectories - global_grad_norm_filter_count
+                )
+            else:
+                global_grad_norm_filter_count = 0.0
+                global_n_trajectories = float(n_trajectories)
+                global_kept_trajectories = global_n_trajectories
 
-            grad_cosine_pending = self.grad_cosine_tracker.prepare(
-                model=self.model,
-                optimizer=self.optimizer,
-                duplicated_param_names=self._duplicated_param_names,
-                device=self.device,
-            )
+            if max_grad_norm is not None and global_kept_trajectories <= 0.0:
+                stats = {
+                    "update_successful": 0.0,
+                    "grad_norm": 0.0,
+                    "lr": float(self.optimizer.param_groups[0]["lr"]),
+                }
+            else:
+                copy_accum_buffers_to_grad_buffers(self.model, accum_buffers)
+                if dp_world_size > 1:
+                    finish_dp_grad_sync(self.model)
 
-            stats = self.optimizer_step()
-            grad_cos_sim = self.grad_cosine_tracker.finalize(
-                grad_cosine_pending,
-                update_successful=stats.get("update_successful", 0.0) == 1.0,
-            )
-            if grad_cos_sim is not None:
-                stats["grad_cos_sim"] = float(grad_cos_sim)
+                grad_cosine_pending = self.grad_cosine_tracker.prepare(
+                    model=self.model,
+                    optimizer=self.optimizer,
+                    duplicated_param_names=self._duplicated_param_names,
+                    device=self.device,
+                )
+
+                stats = self.optimizer_step()
+                grad_cos_sim = self.grad_cosine_tracker.finalize(
+                    grad_cosine_pending,
+                    update_successful=stats.get("update_successful", 0.0) == 1.0,
+                )
+                if grad_cos_sim is not None:
+                    stats["grad_cos_sim"] = float(grad_cos_sim)
+            if max_grad_norm is not None:
+                stats["grad_norm_filter_count"] = global_grad_norm_filter_count
+                stats["grad_norm_filter_fraction"] = (
+                    global_grad_norm_filter_count / max(global_n_trajectories, 1.0)
+                )
             if logprob_grad_accum is not None:
                 stats.update(
                     logprob_grad_accum.summary(

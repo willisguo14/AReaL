@@ -1506,6 +1506,22 @@ class PerTrajectoryConfig:
             )
         },
     )
+    max_grad_norm: float | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Drop per-trajectory gradients whose traced grad_norm exceeds this "
+                "positive threshold. None disables grad-norm filtering."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        if self.max_grad_norm is not None and self.max_grad_norm <= 0.0:
+            raise ValueError(
+                "actor.per_trajectory.max_grad_norm must be positive when set, "
+                f"got {self.max_grad_norm}"
+            )
 
 
 @dataclass
