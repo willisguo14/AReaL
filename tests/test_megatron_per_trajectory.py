@@ -384,7 +384,7 @@ def _engine_stub(**overrides):
         per_trajectory=SimpleNamespace(
             enabled=True,
             flush_threshold=256,
-            max_grad_norm=None,
+            filters=[],
         ),
     )
     engine.parallel_strategy = SimpleNamespace(
@@ -502,7 +502,7 @@ def _setup_per_trajectory_filter_fixture(
     monkeypatch,
     *,
     grad_norms,
-    max_grad_norm=3.0,
+    grad_norm_limit=3.0,
 ):
     torch = megatron_engine.torch
     mb_spec = megatron_engine.MicroBatchSpec(
@@ -512,7 +512,9 @@ def _setup_per_trajectory_filter_fixture(
     )
     engine = _engine_stub()
     engine.config.mb_spec = mb_spec
-    engine.config.per_trajectory.max_grad_norm = max_grad_norm
+    engine.config.per_trajectory.filters = [
+        SimpleNamespace(rule="grad_norm_max", params={"max": grad_norm_limit})
+    ]
     engine.config.pad_to_maximum = False
     engine.device = torch.device("cpu")
     engine.is_offload = False
@@ -918,8 +920,8 @@ def test_train_batch_per_trajectory_uses_single_mb_spec_for_sliced_trajectories(
     ]
     assert stats["num_micro_batches"] == 3
     assert stats["grad_cos_sim"] == pytest.approx(0.25)
-    assert "grad_norm_filter_count" not in stats
-    assert "grad_norm_filter_fraction" not in stats
+    assert "trajectory_filter_count" not in stats
+    assert "trajectory_filter_fraction" not in stats
 
 
 def test_train_batch_per_trajectory_filters_over_threshold_grad_norm(monkeypatch):
@@ -931,7 +933,9 @@ def test_train_batch_per_trajectory_filters_over_threshold_grad_norm(monkeypatch
     )
     engine = _engine_stub()
     engine.config.mb_spec = mb_spec
-    engine.config.per_trajectory.max_grad_norm = 3.0
+    engine.config.per_trajectory.filters = [
+        SimpleNamespace(rule="grad_norm_max", params={"max": 3.0})
+    ]
     engine.config.pad_to_maximum = False
     engine.device = torch.device("cpu")
     engine.is_offload = False
@@ -1123,8 +1127,8 @@ def test_train_batch_per_trajectory_filters_over_threshold_grad_norm(monkeypatch
     assert ("copy_back", ("accum",)) in events
     assert [record.grad_norm for record in tracer.records] == [2.0, 5.0]
     assert [record.accepted for record in tracer.records] == [True, False]
-    assert stats["grad_norm_filter_count"] == pytest.approx(1.0)
-    assert stats["grad_norm_filter_fraction"] == pytest.approx(0.5)
+    assert stats["trajectory_filter_count"] == pytest.approx(1.0)
+    assert stats["trajectory_filter_fraction"] == pytest.approx(0.5)
     assert stats["logp_grad_norm"] == pytest.approx(math.sqrt(2.0))
     assert stats["logp_grad_absmax"] == pytest.approx(1.0)
 
@@ -1153,6 +1157,75 @@ def test_train_batch_per_trajectory_passes_optimizer_step_scale(monkeypatch):
     assert ("optimizer_step", 0.4) in events
 
 
+def test_train_batch_per_trajectory_and_composes_processed_summary_filters(
+    monkeypatch,
+):
+    torch = megatron_engine.torch
+    engine, input_batched, tracer, events = _setup_per_trajectory_filter_fixture(
+        monkeypatch,
+        grad_norms=[2.0, 2.0],
+    )
+    engine.config.per_trajectory.filters = [
+        SimpleNamespace(rule="grad_norm_max", params={"max": 3.0}),
+        SimpleNamespace(rule="advantage_mean_positive", params={}),
+    ]
+    trajectory_seen = {"idx": 0}
+
+    def fake_compute_logprobs_and_loss(
+        output,
+        inputs,
+        loss_fn,
+        loss_weight_fn,
+        total_loss_weight,
+        *,
+        loss_multiplier=1.0,
+        logprob_callback=None,
+        loss_stat_callback=None,
+        logprob_grad_accumulator=None,
+        logprob_grad_loss_multiplier=None,
+    ):
+        del loss_fn, loss_weight_fn, total_loss_weight
+        del logprob_grad_accumulator, logprob_grad_loss_multiplier
+        events.append(("loss", float(loss_multiplier)))
+        if logprob_callback is not None:
+            logprob_callback(torch.tensor([[-0.5, -1.5]], dtype=torch.float32), inputs)
+        idx = trajectory_seen["idx"]
+        trajectory_seen["idx"] += 1
+        advantage = (
+            torch.tensor([[1.0, 3.0]], dtype=torch.float32)
+            if idx == 0
+            else torch.tensor([[-3.0, -1.0]], dtype=torch.float32)
+        )
+        if loss_stat_callback is not None:
+            loss_stat_callback(
+                {
+                    "loss_mask": torch.tensor([[True, True]]),
+                    "entropy": torch.tensor([[0.25, 0.75]]),
+                    "loss_advantage": advantage,
+                    "behave_mask": torch.tensor([[True, True]], dtype=torch.bool),
+                    "behave_imp_weight": torch.tensor([[1.0, 3.0]]),
+                    "behave_approx_kl": torch.tensor([[-0.5, 0.25]]),
+                }
+            )
+        return output.sum()
+
+    monkeypatch.setattr(
+        engine,
+        "_compute_logprobs_and_loss",
+        fake_compute_logprobs_and_loss,
+    )
+
+    stats = _train_per_trajectory_fixture(engine, input_batched)
+
+    assert [event for event in events if event[0] == "accumulate"] == [
+        ("accumulate", ("accum",)),
+    ]
+    assert [record.accepted for record in tracer.records] == [True, False]
+    assert [record.advantage_mean for record in tracer.records] == [2.0, -2.0]
+    assert stats["trajectory_filter_count"] == pytest.approx(1.0)
+    assert stats["trajectory_filter_fraction"] == pytest.approx(0.5)
+
+
 def test_train_batch_per_trajectory_all_filtered_skips_optimizer_step(monkeypatch):
     engine, input_batched, tracer, events = _setup_per_trajectory_filter_fixture(
         monkeypatch,
@@ -1175,8 +1248,8 @@ def test_train_batch_per_trajectory_all_filtered_skips_optimizer_step(monkeypatc
     assert engine.grad_cosine_tracker.prepare_calls == []
     assert engine.grad_cosine_tracker.finalize_calls == []
     assert [record.accepted for record in tracer.records] == [False, False]
-    assert stats["grad_norm_filter_count"] == pytest.approx(2.0)
-    assert stats["grad_norm_filter_fraction"] == pytest.approx(1.0)
+    assert stats["trajectory_filter_count"] == pytest.approx(2.0)
+    assert stats["trajectory_filter_fraction"] == pytest.approx(1.0)
     assert stats["update_successful"] == pytest.approx(0.0)
     assert stats["grad_norm"] == pytest.approx(0.0)
     assert stats["lr"] == pytest.approx(0.01)
@@ -1198,8 +1271,8 @@ def test_train_batch_per_trajectory_filters_non_finite_grad_norm(monkeypatch):
     ]
     assert math.isnan(tracer.records[0].grad_norm)
     assert [record.accepted for record in tracer.records] == [False, True]
-    assert stats["grad_norm_filter_count"] == pytest.approx(1.0)
-    assert stats["grad_norm_filter_fraction"] == pytest.approx(0.5)
+    assert stats["trajectory_filter_count"] == pytest.approx(1.0)
+    assert stats["trajectory_filter_fraction"] == pytest.approx(0.5)
 
 
 def test_train_batch_per_trajectory_reports_global_filter_stats(monkeypatch):
@@ -1227,8 +1300,8 @@ def test_train_batch_per_trajectory_reports_global_filter_stats(monkeypatch):
     assert len(all_reduce_inputs) == 1
     assert all_reduce_inputs[0][0].tolist() == [1.0, 2.0]
     assert all_reduce_inputs[0][2] == "dp-group"
-    assert stats["grad_norm_filter_count"] == pytest.approx(3.0)
-    assert stats["grad_norm_filter_fraction"] == pytest.approx(0.75)
+    assert stats["trajectory_filter_count"] == pytest.approx(3.0)
+    assert stats["trajectory_filter_fraction"] == pytest.approx(0.75)
 
 
 def test_validate_per_trajectory_support_accepts_dense_megatron():
@@ -1508,6 +1581,7 @@ _EXPECTED_PER_TRAJECTORY_TRACE_ROWS = (
         "trajectory_idx": 0,
         "trajectory_id": "traj-a",
         "response_length": 6,
+        "accepted": True,
         "reward": 0.75,
         "logprob_infer_sum": -2.39,
     },
@@ -1517,6 +1591,7 @@ _EXPECTED_PER_TRAJECTORY_TRACE_ROWS = (
         "trajectory_idx": 1,
         "trajectory_id": "traj-b",
         "response_length": 6,
+        "accepted": True,
         "reward": -0.25,
         "logprob_infer_sum": -2.26,
     },
@@ -1538,6 +1613,7 @@ def _assert_per_trajectory_trace_row(row, expected):
         "response_length",
     ):
         _assert_trace_field_matches(row, key, expected[key])
+    _assert_trace_field_matches(row, "accepted", expected["accepted"])
     reward = _assert_finite_trace_value(row, "reward")
     assert reward == pytest.approx(expected["reward"], rel=0.0, abs=0.0)
     _assert_finite_trace_value(row, "grad_norm")
@@ -1573,6 +1649,7 @@ def _valid_per_trajectory_trace_rows():
             "minibatch_idx": 0,
             "trajectory_idx": 0,
             "trajectory_id": "traj-a",
+            "accepted": True,
             "grad_norm": 1.25,
             "logprob_train_sum": -3.0,
             "logprob_train_mean": -0.5,
@@ -1586,6 +1663,7 @@ def _valid_per_trajectory_trace_rows():
             "minibatch_idx": 0,
             "trajectory_idx": 1,
             "trajectory_id": "traj-b",
+            "accepted": True,
             "grad_norm": 2.5,
             "logprob_train_sum": -1.2,
             "logprob_train_mean": -0.2,

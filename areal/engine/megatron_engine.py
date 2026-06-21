@@ -50,10 +50,12 @@ from areal.api.io_struct import DeviceRuntimeInfo
 from areal.engine.core import (
     LogprobGradAccumulator,
     MaskedTensorAccumulator,
+    PerTrajectoryFilterContext,
     PerTrajectoryRecord,
     PerTrajectoryTracer,
     aggregate_eval_losses,
     compute_total_loss_weight,
+    evaluate_per_trajectory_filters,
     per_trajectory_log_dir,
     reorder_and_pad_outputs,
     slice_trajectory,
@@ -1203,8 +1205,11 @@ class MegatronEngine(TrainEngine):
                 n_mbs_divisor=1,
             )
             n_trajectories = int(input_batched["attention_mask"].shape[0])
-            max_grad_norm = getattr(self.config.per_trajectory, "max_grad_norm", None)
-            grad_norm_filter_count = 0
+            per_trajectory_filters = tuple(
+                getattr(self.config.per_trajectory, "filters", ()) or ()
+            )
+            filters_enabled = len(per_trajectory_filters) > 0
+            trajectory_filter_count = 0
             for trajectory_idx in range(n_trajectories):
                 traj_batch = slice_trajectory(input_batched, trajectory_idx)
                 traj_mb_list = self._prepare_mb_list(
@@ -1227,6 +1232,8 @@ class MegatronEngine(TrainEngine):
                 advantage_accum = MaskedTensorAccumulator()
                 behave_imp_weight_accum = MaskedTensorAccumulator()
                 behave_approx_kl_accum = MaskedTensorAccumulator()
+                advantage_mean_emitted = False
+                behave_approx_kl_mean_emitted = False
                 trajectory_logprob_grad_accum = (
                     LogprobGradAccumulator(self.device)
                     if logprob_grad_accum is not None
@@ -1246,6 +1253,7 @@ class MegatronEngine(TrainEngine):
                     train_response_length += summary.length
 
                 def capture_loss_stats(stat: dict[str, Any]) -> None:
+                    nonlocal advantage_mean_emitted, behave_approx_kl_mean_emitted
                     loss_stat_mask = stat.get("loss_mask")
                     if isinstance(loss_stat_mask, torch.Tensor):
                         entropy = stat.get("entropy")
@@ -1254,6 +1262,7 @@ class MegatronEngine(TrainEngine):
                         loss_advantage = stat.get("loss_advantage")
                         if isinstance(loss_advantage, torch.Tensor):
                             advantage_accum.add(loss_advantage, loss_stat_mask)
+                            advantage_mean_emitted = True
 
                     behave_mask = stat.get("behave_mask")
                     if isinstance(behave_mask, torch.Tensor):
@@ -1263,6 +1272,7 @@ class MegatronEngine(TrainEngine):
                         behave_approx_kl = stat.get("behave_approx_kl")
                         if isinstance(behave_approx_kl, torch.Tensor):
                             behave_approx_kl_accum.add(behave_approx_kl, behave_mask)
+                            behave_approx_kl_mean_emitted = True
 
                 def process_output(
                     output: torch.Tensor,
@@ -1304,22 +1314,6 @@ class MegatronEngine(TrainEngine):
                     schedule_scale=schedule_scale,
                 )
                 trace_grad_norm = grad_norm / dp_loss_multiplier
-                accepted = not (
-                    max_grad_norm is not None
-                    and (
-                        not math.isfinite(trace_grad_norm)
-                        or trace_grad_norm > max_grad_norm
-                    )
-                )
-                if not accepted:
-                    grad_norm_filter_count += 1
-                else:
-                    accumulate_grad_buffers(self.model, accum_buffers)
-                    if (
-                        logprob_grad_accum is not None
-                        and trajectory_logprob_grad_accum is not None
-                    ):
-                        logprob_grad_accum.merge(trajectory_logprob_grad_accum)
 
                 rollout_summary = summarize_logprobs(
                     traj_batch["rollout_logprobs"],
@@ -1329,6 +1323,26 @@ class MegatronEngine(TrainEngine):
                 advantage_summary = advantage_accum.summary()
                 behave_imp_weight_summary = behave_imp_weight_accum.summary()
                 behave_approx_kl_summary = behave_approx_kl_accum.summary()
+                filter_context = PerTrajectoryFilterContext(
+                    grad_norm=float(trace_grad_norm),
+                    advantage_summary=advantage_summary,
+                    behave_approx_kl_summary=behave_approx_kl_summary,
+                    advantage_mean_emitted=advantage_mean_emitted,
+                    behave_approx_kl_mean_emitted=behave_approx_kl_mean_emitted,
+                )
+                accepted = evaluate_per_trajectory_filters(
+                    per_trajectory_filters,
+                    filter_context,
+                )
+                if accepted:
+                    accumulate_grad_buffers(self.model, accum_buffers)
+                    if (
+                        logprob_grad_accum is not None
+                        and trajectory_logprob_grad_accum is not None
+                    ):
+                        logprob_grad_accum.merge(trajectory_logprob_grad_accum)
+                else:
+                    trajectory_filter_count += 1
                 trainer_global_step = self._extract_scalar_from_batch(
                     traj_batch,
                     "trainer_global_step",
@@ -1348,7 +1362,7 @@ class MegatronEngine(TrainEngine):
                         trajectory_idx=trajectory_idx,
                         trajectory_id=trajectory_id,
                         grad_norm=float(trace_grad_norm),
-                        accepted=accepted,
+                        accepted=bool(accepted),
                         logprob_train_sum=float(train_logprob_sum),
                         logprob_train_mean=float(
                             train_logprob_sum / train_response_length
@@ -1371,25 +1385,25 @@ class MegatronEngine(TrainEngine):
                 )
                 self.optimizer_zero_grad()
 
-            if max_grad_norm is not None:
+            if filters_enabled:
                 filter_stats = torch.tensor(
-                    [float(grad_norm_filter_count), float(n_trajectories)],
+                    [float(trajectory_filter_count), float(n_trajectories)],
                     dtype=torch.float32,
                     device=self.device,
                 )
                 if dist.is_available() and dist.is_initialized():
                     dist.all_reduce(filter_stats, op=dist.ReduceOp.SUM, group=dp_group)
-                global_grad_norm_filter_count = float(filter_stats[0].item())
+                global_trajectory_filter_count = float(filter_stats[0].item())
                 global_n_trajectories = float(filter_stats[1].item())
                 global_kept_trajectories = (
-                    global_n_trajectories - global_grad_norm_filter_count
+                    global_n_trajectories - global_trajectory_filter_count
                 )
             else:
-                global_grad_norm_filter_count = 0.0
+                global_trajectory_filter_count = 0.0
                 global_n_trajectories = float(n_trajectories)
                 global_kept_trajectories = global_n_trajectories
 
-            if max_grad_norm is not None and global_kept_trajectories <= 0.0:
+            if filters_enabled and global_kept_trajectories <= 0.0:
                 stats = {
                     "update_successful": 0.0,
                     "grad_norm": 0.0,
@@ -1414,10 +1428,10 @@ class MegatronEngine(TrainEngine):
                 )
                 if grad_cos_sim is not None:
                     stats["grad_cos_sim"] = float(grad_cos_sim)
-            if max_grad_norm is not None:
-                stats["grad_norm_filter_count"] = global_grad_norm_filter_count
-                stats["grad_norm_filter_fraction"] = (
-                    global_grad_norm_filter_count / max(global_n_trajectories, 1.0)
+            if filters_enabled:
+                stats["trajectory_filter_count"] = global_trajectory_filter_count
+                stats["trajectory_filter_fraction"] = (
+                    global_trajectory_filter_count / max(global_n_trajectories, 1.0)
                 )
             if logprob_grad_accum is not None:
                 stats.update(
