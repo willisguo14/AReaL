@@ -92,7 +92,7 @@ class PerTrajectoryRecord:
     logprob_infer_mean: float
     reward: float
     response_length: int
-    grad_norm_filtered: bool = False
+    accepted: bool = True
     entropy_mean: float | None = None
     advantage_min: float | None = None
     advantage_max: float | None = None

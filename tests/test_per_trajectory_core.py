@@ -62,21 +62,22 @@ def _masked_summary(mean, count=1):
     return MaskedTensorSummary(min=mean, max=mean, mean=mean, count=count)
 
 
-def test_per_trajectory_record_defaults_grad_norm_filtered_false():
+def test_per_trajectory_record_defaults_accepted_true():
     record = _record()
 
-    assert record.grad_norm_filtered is False
-    assert asdict(record)["grad_norm_filtered"] is False
+    assert record.accepted is True
+    assert asdict(record)["accepted"] is True
 
 
-def test_tracer_writes_grad_norm_filtered_flag(tmp_path):
+def test_tracer_writes_accepted_flag(tmp_path):
     path = tmp_path / "trace.jsonl"
     tracer = PerTrajectoryTracer(path=path, flush_threshold=1, enabled=True)
 
-    tracer.write(_record(grad_norm_filtered=True))
+    tracer.write(_record(accepted=False))
 
     row = json.loads(path.read_text(encoding="utf-8"))
-    assert row["grad_norm_filtered"] is True
+    assert row["accepted"] is False
+    assert "grad_norm_filtered" not in row
 
 
 def test_normalize_flush_threshold_falls_back_to_one():
@@ -693,7 +694,7 @@ def test_tracer_explicit_flush_creates_parent_and_writes_sorted_jsonl(tmp_path):
     assert path.read_text(encoding="utf-8") == (expected + "\n")
     assert ": " not in expected
     assert ", " not in expected
-    assert expected.startswith('{"advantage_max":')
+    assert expected.startswith('{"accepted":')
 
 
 def test_tracer_rejects_non_finite_values(tmp_path):
