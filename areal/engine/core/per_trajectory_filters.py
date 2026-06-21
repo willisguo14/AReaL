@@ -83,10 +83,11 @@ def _reject_extra_params(
     params: FilterParams,
     allowed: set[str],
 ) -> None:
-    extra = sorted(set(params) - allowed)
+    extra = sorted((key for key in params if key not in allowed), key=repr)
     if extra:
+        rendered = ", ".join(repr(key) for key in extra)
         raise ValueError(
-            f"{rule} per-trajectory filter does not accept params: {', '.join(extra)}"
+            f"{rule} per-trajectory filter does not accept params: {rendered}"
         )
 
 

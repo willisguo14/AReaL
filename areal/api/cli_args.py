@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+from collections.abc import Sequence
 from dataclasses import MISSING as dataclass_missing
 from dataclasses import asdict, dataclass, field, fields
 from enum import Enum
@@ -1551,6 +1552,12 @@ class PerTrajectoryConfig:
             validate_per_trajectory_filter_config,
         )
 
+        if not isinstance(self.filters, Sequence) or isinstance(
+            self.filters, (str, bytes)
+        ):
+            raise ValueError(
+                "actor.per_trajectory.filters must be a sequence of filter configs"
+            )
         for filter_config in self.filters:
             validate_per_trajectory_filter_config(filter_config)
 

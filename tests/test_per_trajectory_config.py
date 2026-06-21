@@ -46,6 +46,12 @@ def test_per_trajectory_filter_config_accepts_generic_params():
     assert config.params == {"lower": -0.1, "upper": 0.2}
 
 
+@pytest.mark.parametrize("filters", [None, object()])
+def test_per_trajectory_config_rejects_invalid_filters_list(filters):
+    with pytest.raises(ValueError, match="filters.*sequence"):
+        PerTrajectoryConfig(filters=filters)
+
+
 @pytest.mark.parametrize("rule", ["missing", "", "grad_norm"])
 def test_per_trajectory_filter_config_rejects_unknown_rule(rule):
     with pytest.raises(ValueError, match="unknown per-trajectory filter rule"):

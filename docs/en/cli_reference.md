@@ -82,6 +82,7 @@ For detailed examples, see the experiment configurations in the `examples/` dire
 - [MegatronEngine Configuration](section-megatron-engine)
 - [MemoryProfiler Configuration](section-memory-profiler)
 - [PerTrajectory Configuration](section-per-trajectory)
+- [PerTrajectoryFilter Configuration](section-per-trajectory-filter)
 - [PerfTracer Configuration](section-perf-tracer)
 - [RejectionSampling Configuration](section-rejection-sampling)
 - [Scheduler Configuration](section-scheduler)
@@ -1132,11 +1133,22 @@ entries for torch.cuda.memory.\_record_memory_history.
 
 Configuration for exact per-trajectory actor gradient tracing.
 
-| Parameter         | Type          | Default | Description                                                                                                              |
-| ----------------- | ------------- | ------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `enabled`         | boolean       | `False` | Enable exact per-trajectory actor gradient tracing.                                                                      |
-| `flush_threshold` | integer       | `256`   | Flush per-trajectory JSONL records once this many entries are buffered. Values \<= 0 fall back to 1.                     |
-| `max_grad_norm`   | float \| None | `None`  | Drop per-trajectory gradients whose traced grad_norm exceeds this positive threshold. None disables grad-norm filtering. |
+| Parameter         | Type                                                                 | Default      | Description                                                                                           |
+| ----------------- | -------------------------------------------------------------------- | ------------ | ----------------------------------------------------------------------------------------------------- |
+| `enabled`         | boolean                                                              | `False`      | Enable exact per-trajectory actor gradient tracing.                                                   |
+| `flush_threshold` | integer                                                              | `256`        | Flush per-trajectory JSONL records once this many entries are buffered. Values \<= 0 fall back to 1.  |
+| `filters`         | list of [`PerTrajectoryFilterConfig`](section-per-trajectory-filter) | **Required** | Post-backward per-trajectory filters. Rules are AND-composed; an empty list accepts every trajectory. |
+
+(section-per-trajectory-filter)=
+
+## PerTrajectoryFilter Configuration
+
+Configuration for one built-in post-backward per-trajectory filter.
+
+| Parameter | Type   | Default      | Description                                                                                                      |
+| --------- | ------ | ------------ | ---------------------------------------------------------------------------------------------------------------- |
+| `rule`    | string | **Required** | Built-in per-trajectory filter rule. Supported rules: none, grad_norm_max, kl_k1_range, advantage_mean_positive. |
+| `params`  | `dict` | **Required** | Rule-specific parameters. Each built-in rule validates its own accepted keys and value constraints.              |
 
 (section-perf-tracer)=
 

@@ -9,6 +9,7 @@ import torch
 import areal.engine.core.per_trajectory as per_trajectory_module
 from areal.engine.core.per_trajectory import (
     MaskedTensorAccumulator,
+    MaskedTensorSummary,
     PerTrajectoryRecord,
     PerTrajectoryTracer,
     attach_trainer_step_metadata,
@@ -18,6 +19,10 @@ from areal.engine.core.per_trajectory import (
     slice_trajectory,
     summarize_logprobs,
     trajectory_id_from_sample,
+)
+from areal.engine.core.per_trajectory_filters import (
+    PerTrajectoryFilterContext,
+    evaluate_per_trajectory_filters,
 )
 
 
@@ -37,6 +42,24 @@ def _record(**overrides):
     }
     values.update(overrides)
     return PerTrajectoryRecord(**values)
+
+
+def _filter_context(**overrides):
+    values = {
+        "grad_norm": 1.0,
+        "advantage_summary": None,
+        "behave_approx_kl_summary": None,
+        "advantage_mean_emitted": False,
+        "behave_approx_kl_mean_emitted": False,
+    }
+    values.update(overrides)
+    return PerTrajectoryFilterContext(**values)
+
+
+def _masked_summary(mean, count=1):
+    if count == 0:
+        return MaskedTensorSummary(min=None, max=None, mean=None, count=0)
+    return MaskedTensorSummary(min=mean, max=mean, mean=mean, count=count)
 
 
 def test_per_trajectory_record_defaults_grad_norm_filtered_false():
@@ -67,6 +90,139 @@ def test_core_package_reexports_normalize_flush_threshold():
     from areal.engine.core import normalize_flush_threshold as exported
 
     assert exported("4") == 4
+
+
+def test_evaluate_per_trajectory_filters_empty_list_accepts():
+    assert evaluate_per_trajectory_filters([], _filter_context(grad_norm=float("nan")))
+
+
+def test_evaluate_per_trajectory_filters_none_rule_accepts():
+    assert evaluate_per_trajectory_filters(
+        [SimpleNamespace(rule="none", params={})],
+        _filter_context(),
+    )
+
+
+@pytest.mark.parametrize("params", [{"unexpected": 1}, {1: "unexpected"}])
+def test_evaluate_per_trajectory_filters_none_rule_rejects_params(params):
+    with pytest.raises(ValueError, match="none.*does not accept params"):
+        evaluate_per_trajectory_filters(
+            [SimpleNamespace(rule="none", params=params)],
+            _filter_context(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("grad_norm", "expected"),
+    [
+        (2.0, True),
+        (2.5, True),
+        (2.6, False),
+        (float("inf"), False),
+        (float("nan"), False),
+    ],
+)
+def test_evaluate_per_trajectory_filters_grad_norm_max(grad_norm, expected):
+    assert (
+        evaluate_per_trajectory_filters(
+            [SimpleNamespace(rule="grad_norm_max", params={"max": 2.5})],
+            _filter_context(grad_norm=grad_norm),
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("mean", "params", "expected"),
+    [
+        (0.1, {"lower": 0.0}, True),
+        (-0.1, {"lower": 0.0}, False),
+        (0.1, {"upper": 0.2}, True),
+        (0.3, {"upper": 0.2}, False),
+        (0.1, {"lower": 0.0, "upper": 0.2}, True),
+    ],
+)
+def test_evaluate_per_trajectory_filters_kl_k1_range(mean, params, expected):
+    assert (
+        evaluate_per_trajectory_filters(
+            [SimpleNamespace(rule="kl_k1_range", params=params)],
+            _filter_context(
+                behave_approx_kl_summary=_masked_summary(mean),
+                behave_approx_kl_mean_emitted=True,
+            ),
+        )
+        is expected
+    )
+
+
+def test_evaluate_per_trajectory_filters_kl_k1_range_requires_emitted_summary():
+    with pytest.raises(RuntimeError, match="behave_approx_kl_mean"):
+        evaluate_per_trajectory_filters(
+            [SimpleNamespace(rule="kl_k1_range", params={"upper": 0.2})],
+            _filter_context(behave_approx_kl_summary=_masked_summary(0.1)),
+        )
+
+
+def test_evaluate_per_trajectory_filters_kl_k1_range_rejects_empty_summary():
+    assert not evaluate_per_trajectory_filters(
+        [SimpleNamespace(rule="kl_k1_range", params={"upper": 0.2})],
+        _filter_context(
+            behave_approx_kl_summary=_masked_summary(None, count=0),
+            behave_approx_kl_mean_emitted=True,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected"),
+    [
+        (_masked_summary(0.1), True),
+        (_masked_summary(0.0), False),
+        (_masked_summary(-0.1), False),
+        (_masked_summary(None, count=0), False),
+    ],
+)
+def test_evaluate_per_trajectory_filters_advantage_mean_positive(summary, expected):
+    assert (
+        evaluate_per_trajectory_filters(
+            [SimpleNamespace(rule="advantage_mean_positive", params={})],
+            _filter_context(
+                advantage_summary=summary,
+                advantage_mean_emitted=True,
+            ),
+        )
+        is expected
+    )
+
+
+def test_evaluate_per_trajectory_filters_advantage_mean_positive_requires_emitted_summary():
+    with pytest.raises(RuntimeError, match="advantage_mean"):
+        evaluate_per_trajectory_filters(
+            [SimpleNamespace(rule="advantage_mean_positive", params={})],
+            _filter_context(advantage_summary=_masked_summary(0.1)),
+        )
+
+
+def test_evaluate_per_trajectory_filters_and_composes_rules():
+    assert not evaluate_per_trajectory_filters(
+        [
+            SimpleNamespace(rule="none", params={}),
+            SimpleNamespace(rule="grad_norm_max", params={"max": 2.0}),
+            SimpleNamespace(rule="advantage_mean_positive", params={}),
+        ],
+        _filter_context(
+            grad_norm=2.5,
+            advantage_summary=_masked_summary(0.1),
+            advantage_mean_emitted=True,
+        ),
+    )
+
+
+def test_evaluate_per_trajectory_filters_accepts_mapping_configs():
+    assert evaluate_per_trajectory_filters(
+        [{"rule": "grad_norm_max", "params": {"max": 2.0}}],
+        _filter_context(grad_norm=1.5),
+    )
 
 
 def test_per_trajectory_log_dir_uses_expected_layout(monkeypatch):
