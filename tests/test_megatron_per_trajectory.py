@@ -900,7 +900,7 @@ def test_train_batch_per_trajectory_uses_single_mb_spec_for_sliced_trajectories(
     assert tracer.closed is True
     assert [record.trajectory_id for record in tracer.records] == ["traj-a", "traj-b"]
     assert [record.grad_norm for record in tracer.records] == [3.5, 3.5]
-    assert [record.grad_norm_filtered for record in tracer.records] == [False, False]
+    assert [record.accepted for record in tracer.records] == [True, True]
     assert [record.reward for record in tracer.records] == [1.0, 0.0]
     assert [record.logprob_train_sum for record in tracer.records] == [-1.5, -1.5]
     assert [record.entropy_mean for record in tracer.records] == [0.5, 0.5]
@@ -1122,7 +1122,7 @@ def test_train_batch_per_trajectory_filters_over_threshold_grad_norm(monkeypatch
     ]
     assert ("copy_back", ("accum",)) in events
     assert [record.grad_norm for record in tracer.records] == [2.0, 5.0]
-    assert [record.grad_norm_filtered for record in tracer.records] == [False, True]
+    assert [record.accepted for record in tracer.records] == [True, False]
     assert stats["grad_norm_filter_count"] == pytest.approx(1.0)
     assert stats["grad_norm_filter_fraction"] == pytest.approx(0.5)
     assert stats["logp_grad_norm"] == pytest.approx(math.sqrt(2.0))
@@ -1174,7 +1174,7 @@ def test_train_batch_per_trajectory_all_filtered_skips_optimizer_step(monkeypatc
     assert [event for event in events if event[0] == "optimizer_step"] == []
     assert engine.grad_cosine_tracker.prepare_calls == []
     assert engine.grad_cosine_tracker.finalize_calls == []
-    assert [record.grad_norm_filtered for record in tracer.records] == [True, True]
+    assert [record.accepted for record in tracer.records] == [False, False]
     assert stats["grad_norm_filter_count"] == pytest.approx(2.0)
     assert stats["grad_norm_filter_fraction"] == pytest.approx(1.0)
     assert stats["update_successful"] == pytest.approx(0.0)
@@ -1197,7 +1197,7 @@ def test_train_batch_per_trajectory_filters_non_finite_grad_norm(monkeypatch):
         ("accumulate", ("accum",)),
     ]
     assert math.isnan(tracer.records[0].grad_norm)
-    assert [record.grad_norm_filtered for record in tracer.records] == [True, False]
+    assert [record.accepted for record in tracer.records] == [False, True]
     assert stats["grad_norm_filter_count"] == pytest.approx(1.0)
     assert stats["grad_norm_filter_fraction"] == pytest.approx(0.5)
 
@@ -1223,7 +1223,7 @@ def test_train_batch_per_trajectory_reports_global_filter_stats(monkeypatch):
     assert [event for event in events if event[0] == "accumulate"] == [
         ("accumulate", ("accum",)),
     ]
-    assert [record.grad_norm_filtered for record in tracer.records] == [False, True]
+    assert [record.accepted for record in tracer.records] == [True, False]
     assert len(all_reduce_inputs) == 1
     assert all_reduce_inputs[0][0].tolist() == [1.0, 2.0]
     assert all_reduce_inputs[0][2] == "dp-group"

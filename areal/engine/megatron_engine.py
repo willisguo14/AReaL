@@ -1304,11 +1304,14 @@ class MegatronEngine(TrainEngine):
                     schedule_scale=schedule_scale,
                 )
                 trace_grad_norm = grad_norm / dp_loss_multiplier
-                grad_norm_filtered = max_grad_norm is not None and (
-                    not math.isfinite(trace_grad_norm)
-                    or trace_grad_norm > max_grad_norm
+                accepted = not (
+                    max_grad_norm is not None
+                    and (
+                        not math.isfinite(trace_grad_norm)
+                        or trace_grad_norm > max_grad_norm
+                    )
                 )
-                if grad_norm_filtered:
+                if not accepted:
                     grad_norm_filter_count += 1
                 else:
                     accumulate_grad_buffers(self.model, accum_buffers)
@@ -1345,7 +1348,7 @@ class MegatronEngine(TrainEngine):
                         trajectory_idx=trajectory_idx,
                         trajectory_id=trajectory_id,
                         grad_norm=float(trace_grad_norm),
-                        grad_norm_filtered=bool(grad_norm_filtered),
+                        accepted=accepted,
                         logprob_train_sum=float(train_logprob_sum),
                         logprob_train_mean=float(
                             train_logprob_sum / train_response_length
