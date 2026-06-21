@@ -16,6 +16,11 @@ from areal.engine.core.per_trajectory import (
     summarize_logprobs,
     trajectory_id_from_sample,
 )
+from areal.engine.core.per_trajectory_filters import (
+    PerTrajectoryFilterContext,
+    evaluate_per_trajectory_filters,
+    validate_per_trajectory_filter_config,
+)
 from areal.engine.core.train_engine import (
     LOGP_GRAD_ABSMAX_KEY,
     LOGP_GRAD_NORM_KEY,
@@ -36,9 +41,11 @@ __all__ = [
     "LogprobSummary",
     "MaskedTensorAccumulator",
     "MaskedTensorSummary",
+    "PerTrajectoryFilterContext",
     "PerTrajectoryRecord",
     "PerTrajectoryTracer",
     "attach_trainer_step_metadata",
+    "evaluate_per_trajectory_filters",
     "normalize_flush_threshold",
     "per_trajectory_log_dir",
     "preserve_rollout_logprobs",
@@ -48,4 +55,5 @@ __all__ = [
     "temporary_optimizer_lr_scale",
     "trajectory_id_from_sample",
     "validate_optimizer_step_scale",
+    "validate_per_trajectory_filter_config",
 ]

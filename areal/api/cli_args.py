@@ -1490,6 +1490,36 @@ class ESSScalingConfig:
 
 
 @dataclass
+class PerTrajectoryFilterConfig:
+    """Configuration for one built-in post-backward per-trajectory filter."""
+
+    rule: str = field(
+        metadata={
+            "help": (
+                "Built-in per-trajectory filter rule. Supported rules: "
+                "none, grad_norm_max, kl_k1_range, advantage_mean_positive."
+            )
+        }
+    )
+    params: dict[str, Any] = field(
+        default_factory=dict,
+        metadata={
+            "help": (
+                "Rule-specific parameters. Each built-in rule validates its own "
+                "accepted keys and value constraints."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        from areal.engine.core.per_trajectory_filters import (
+            validate_per_trajectory_filter_config,
+        )
+
+        validate_per_trajectory_filter_config(self)
+
+
+@dataclass
 class PerTrajectoryConfig:
     """Configuration for exact per-trajectory actor gradient tracing."""
 
@@ -1506,22 +1536,23 @@ class PerTrajectoryConfig:
             )
         },
     )
-    max_grad_norm: float | None = field(
-        default=None,
+    filters: list[PerTrajectoryFilterConfig] = field(
+        default_factory=list,
         metadata={
             "help": (
-                "Drop per-trajectory gradients whose traced grad_norm exceeds this "
-                "positive threshold. None disables grad-norm filtering."
+                "Post-backward per-trajectory filters. Rules are AND-composed; "
+                "an empty list accepts every trajectory."
             )
         },
     )
 
     def __post_init__(self):
-        if self.max_grad_norm is not None and self.max_grad_norm <= 0.0:
-            raise ValueError(
-                "actor.per_trajectory.max_grad_norm must be positive when set, "
-                f"got {self.max_grad_norm}"
-            )
+        from areal.engine.core.per_trajectory_filters import (
+            validate_per_trajectory_filter_config,
+        )
+
+        for filter_config in self.filters:
+            validate_per_trajectory_filter_config(filter_config)
 
 
 @dataclass
