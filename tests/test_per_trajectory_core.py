@@ -697,25 +697,40 @@ def test_tracer_explicit_flush_creates_parent_and_writes_sorted_jsonl(tmp_path):
     assert expected.startswith('{"accepted":')
 
 
-def test_tracer_rejects_non_finite_values(tmp_path):
+def test_tracer_serializes_non_finite_values_as_null(tmp_path):
     path = tmp_path / "trace.jsonl"
     tracer = PerTrajectoryTracer(path=path, flush_threshold=10, enabled=True)
-    tracer.write(_record(grad_norm=float("nan")))
+    tracer.write(
+        _record(
+            accepted=False,
+            grad_norm=float("nan"),
+            entropy_mean=float("inf"),
+            advantage_min=float("-inf"),
+        )
+    )
 
-    with pytest.raises(ValueError, match="Out of range float values"):
-        tracer.flush()
+    tracer.flush()
+
+    row = json.loads(path.read_text(encoding="utf-8"))
+    assert row["accepted"] is False
+    assert row["grad_norm"] is None
+    assert row["entropy_mean"] is None
+    assert row["advantage_min"] is None
+    assert "grad_norm_filtered" not in row
 
 
-def test_tracer_failed_serialization_writes_no_partial_rows(tmp_path):
+def test_tracer_serializes_mixed_finite_and_non_finite_rows(tmp_path):
     path = tmp_path / "trace.jsonl"
     tracer = PerTrajectoryTracer(path=path, flush_threshold=10, enabled=True)
     tracer.write(_record(trajectory_id="valid"))
     tracer.write(_record(trajectory_id="bad", grad_norm=float("nan")))
 
-    with pytest.raises(ValueError, match="Out of range float values"):
-        tracer.flush()
+    tracer.flush()
 
-    assert not path.exists()
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [row["trajectory_id"] for row in rows] == ["valid", "bad"]
+    assert rows[0]["grad_norm"] == 1.5
+    assert rows[1]["grad_norm"] is None
 
 
 def test_tracer_close_flushes_partial_buffer(tmp_path):

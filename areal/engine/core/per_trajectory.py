@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import getpass
 import json
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -112,6 +113,16 @@ def normalize_flush_threshold(value: Any) -> int:
         return 1
 
 
+def _json_safe_trace_value(value: Any) -> Any:
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_safe_trace_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe_trace_value(item) for item in value]
+    return value
+
+
 class PerTrajectoryTracer:
     """Buffered JSONL trace writer.
 
@@ -143,7 +154,7 @@ class PerTrajectoryTracer:
 
         lines = [
             json.dumps(
-                dataclasses.asdict(record),
+                _json_safe_trace_value(dataclasses.asdict(record)),
                 ensure_ascii=False,
                 sort_keys=True,
                 allow_nan=False,
