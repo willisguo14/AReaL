@@ -701,6 +701,23 @@ def _train_per_trajectory_fixture(
     )
 
 
+def test_compute_kl_k1_zscore_stats_zero_std_sets_zero_zscore():
+    torch = megatron_engine.torch
+
+    stats = megatron_engine._compute_kl_k1_zscore_stats(
+        {
+            "prox_logp": torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
+            "logprobs": torch.zeros(2, 2),
+            "loss_mask": torch.tensor([[False, True], [False, True]]),
+        }
+    )
+
+    assert stats.mean.tolist() == [1.0, 1.0]
+    assert stats.batch_mean == pytest.approx(1.0)
+    assert stats.batch_std == pytest.approx(0.0)
+    assert stats.zscore.tolist() == [0.0, 0.0]
+
+
 def test_train_batch_per_trajectory_uses_single_mb_spec_for_sliced_trajectories(
     monkeypatch,
 ):
@@ -1238,6 +1255,60 @@ def test_train_batch_per_trajectory_and_composes_processed_summary_mask_filters(
     assert [record.advantage_mean for record in tracer.records] == [2.0, -2.0]
     assert stats["trajectory_filter_count"] == pytest.approx(1.0)
     assert stats["trajectory_filter_fraction"] == pytest.approx(0.5)
+
+
+def test_train_batch_per_trajectory_filters_kl_k1_zscore_outlier(monkeypatch):
+    torch = megatron_engine.torch
+    engine, input_batched, tracer, events = _setup_per_trajectory_filter_fixture(
+        monkeypatch,
+        grad_norms=[2.0, 2.0, 2.0],
+    )
+    engine.config.per_trajectory.mask_filters = [
+        SimpleNamespace(rule="kl_k1_zscore_exceeds", params={"n": 1.0})
+    ]
+    input_batched.update(
+        {
+            "input_ids": torch.tensor([[1, 2], [3, 4], [5, 6]]),
+            "attention_mask": torch.ones(3, 2, dtype=torch.bool),
+            "loss_mask": torch.tensor([[False, True], [False, True], [False, True]]),
+            "rollout_logprobs": torch.tensor(
+                [[-0.1, -0.2], [-0.3, -0.4], [-0.5, -0.6]]
+            ),
+            "rollout_loss_mask": torch.tensor(
+                [[False, True], [False, True], [False, True]]
+            ),
+            "task_reward": torch.tensor([1.0, 0.0, 0.0]),
+            "trainer_global_step": torch.tensor([9, 9, 9]),
+            "uid": ["traj-a", "traj-b", "traj-c"],
+            "logprobs": torch.zeros(3, 2),
+            "prox_logp": torch.tensor([[0.0, 0.0], [0.0, 0.0], [0.0, 10.0]]),
+        }
+    )
+
+    stats = _train_per_trajectory_fixture(engine, input_batched)
+
+    assert [event for event in events if event[0] == "accumulate"] == [
+        ("accumulate", ("accum",)),
+        ("accumulate", ("accum",)),
+    ]
+    assert [record.accepted for record in tracer.records] == [True, True, False]
+    assert [record.trajectory_id for record in tracer.records] == [
+        "traj-a",
+        "traj-b",
+        "traj-c",
+    ]
+    assert [record.kl_k1_mean for record in tracer.records] == [0.0, 0.0, 10.0]
+    assert [record.kl_k1_batch_mean for record in tracer.records] == pytest.approx(
+        [10.0 / 3.0, 10.0 / 3.0, 10.0 / 3.0]
+    )
+    assert [record.kl_k1_batch_std for record in tracer.records] == pytest.approx(
+        [4.714045, 4.714045, 4.714045]
+    )
+    assert [record.kl_k1_zscore for record in tracer.records] == pytest.approx(
+        [0.7071068, 0.7071068, 1.4142135]
+    )
+    assert stats["trajectory_filter_count"] == pytest.approx(1.0)
+    assert stats["trajectory_filter_fraction"] == pytest.approx(1.0 / 3.0)
 
 
 def test_train_batch_per_trajectory_all_filtered_skips_optimizer_step(monkeypatch):

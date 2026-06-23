@@ -16,6 +16,10 @@ class PerTrajectoryFilterContext:
     grad_norm: float
     advantage_summary: MaskedTensorSummary | None = None
     behave_approx_kl_summary: MaskedTensorSummary | None = None
+    kl_k1_mean: float | None = None
+    kl_k1_batch_mean: float | None = None
+    kl_k1_batch_std: float | None = None
+    kl_k1_zscore: float | None = None
     advantage_mean_emitted: bool = False
     behave_approx_kl_mean_emitted: bool = False
 
@@ -121,6 +125,19 @@ def _validate_kl_k1_outside_range(params: FilterParams) -> None:
         )
 
 
+def _validate_kl_k1_zscore_exceeds(params: FilterParams) -> None:
+    _reject_extra_params("kl_k1_zscore_exceeds", params, {"n"})
+    if "n" not in params:
+        raise ValueError(
+            "kl_k1_zscore_exceeds per-trajectory mask filter requires finite n"
+        )
+    n_std = _finite_float("kl_k1_zscore_exceeds", "n", params["n"])
+    if n_std < 0.0:
+        raise ValueError(
+            "kl_k1_zscore_exceeds per-trajectory mask filter n must be non-negative"
+        )
+
+
 def _validate_advantage_mean_positive(params: FilterParams) -> None:
     _reject_extra_params("advantage_mean_positive", params, set())
 
@@ -179,6 +196,15 @@ def _kl_k1_outside_range(
     return False
 
 
+def _kl_k1_zscore_exceeds(
+    params: FilterParams,
+    context: PerTrajectoryFilterContext,
+) -> bool:
+    n_std = _finite_float("kl_k1_zscore_exceeds", "n", params["n"])
+    zscore = _finite_context_float(context.kl_k1_zscore)
+    return zscore is not None and zscore > n_std
+
+
 def _advantage_mean_positive(
     params: FilterParams,
     context: PerTrajectoryFilterContext,
@@ -195,12 +221,14 @@ def _advantage_mean_positive(
 PER_TRAJECTORY_FILTER_RULES: dict[str, FilterFn] = {
     "grad_norm_exceeds_max": _grad_norm_exceeds_max,
     "kl_k1_outside_range": _kl_k1_outside_range,
+    "kl_k1_zscore_exceeds": _kl_k1_zscore_exceeds,
     "advantage_mean_positive": _advantage_mean_positive,
 }
 
 _VALIDATORS: dict[str, ValidatorFn] = {
     "grad_norm_exceeds_max": _validate_grad_norm_exceeds_max,
     "kl_k1_outside_range": _validate_kl_k1_outside_range,
+    "kl_k1_zscore_exceeds": _validate_kl_k1_zscore_exceeds,
     "advantage_mean_positive": _validate_advantage_mean_positive,
 }
 

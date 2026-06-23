@@ -107,6 +107,10 @@ class PerTrajectoryRecord:
     behave_approx_kl_min: float | None = None
     behave_approx_kl_max: float | None = None
     behave_approx_kl_mean: float | None = None
+    kl_k1_mean: float | None = None
+    kl_k1_batch_mean: float | None = None
+    kl_k1_batch_std: float | None = None
+    kl_k1_zscore: float | None = None
 
 
 def normalize_flush_threshold(value: Any) -> int:

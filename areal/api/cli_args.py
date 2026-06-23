@@ -1499,6 +1499,7 @@ class PerTrajectoryFilterConfig:
             "help": (
                 "Built-in per-trajectory mask filter rule. Supported rules: "
                 "grad_norm_exceeds_max, kl_k1_outside_range, "
+                "kl_k1_zscore_exceeds, "
                 "advantage_mean_positive."
             )
         }

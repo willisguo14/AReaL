@@ -85,6 +85,22 @@ def test_kl_k1_outside_range_filter_rejects_inverted_bounds():
         )
 
 
+def test_kl_k1_zscore_filter_accepts_n():
+    config = PerTrajectoryFilterConfig(
+        rule="kl_k1_zscore_exceeds",
+        params={"n": 2.0},
+    )
+
+    assert config.rule == "kl_k1_zscore_exceeds"
+    assert config.params == {"n": 2.0}
+
+
+@pytest.mark.parametrize("params", [{}, {"n": -1.0}, {"n": float("inf")}])
+def test_kl_k1_zscore_filter_rejects_invalid_n(params):
+    with pytest.raises(ValueError, match="kl_k1_zscore_exceeds.*n"):
+        PerTrajectoryFilterConfig(rule="kl_k1_zscore_exceeds", params=params)
+
+
 def test_advantage_mean_positive_rejects_params():
     with pytest.raises(ValueError, match="does not accept params"):
         PerTrajectoryFilterConfig(

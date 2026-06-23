@@ -1143,10 +1143,10 @@ Configuration for exact per-trajectory actor gradient tracing.
 
 Configuration for one built-in post-backward per-trajectory mask filter.
 
-| Parameter | Type   | Default      | Description                                                                                                                     |
-| --------- | ------ | ------------ | ------------------------------------------------------------------------------------------------------------------------------- |
-| `rule`    | string | **Required** | Built-in per-trajectory mask filter rule. Supported rules: grad_norm_exceeds_max, kl_k1_outside_range, advantage_mean_positive. |
-| `params`  | `dict` | **Required** | Rule-specific parameters. Each built-in mask rule validates its own accepted keys and value constraints.                        |
+| Parameter | Type   | Default      | Description                                                                                                                                           |
+| --------- | ------ | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rule`    | string | **Required** | Built-in per-trajectory mask filter rule. Supported rules: grad_norm_exceeds_max, kl_k1_outside_range, kl_k1_zscore_exceeds, advantage_mean_positive. |
+| `params`  | `dict` | **Required** | Rule-specific parameters. Each built-in mask rule validates its own accepted keys and value constraints.                                              |
 
 (section-perf-tracer)=
 

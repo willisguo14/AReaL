@@ -170,6 +170,30 @@ def test_evaluate_per_trajectory_mask_filters_kl_k1_outside_range_does_not_mask_
 
 
 @pytest.mark.parametrize(
+    ("zscore", "expected"),
+    [
+        (1.5, False),
+        (2.0, False),
+        (2.1, True),
+        (float("nan"), False),
+    ],
+)
+def test_evaluate_per_trajectory_mask_filters_kl_k1_zscore_exceeds(zscore, expected):
+    assert (
+        evaluate_per_trajectory_mask_filters(
+            [SimpleNamespace(rule="kl_k1_zscore_exceeds", params={"n": 2.0})],
+            _filter_context(
+                kl_k1_mean=0.2,
+                kl_k1_batch_mean=0.0,
+                kl_k1_batch_std=0.1,
+                kl_k1_zscore=zscore,
+            ),
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
     ("summary", "expected"),
     [
         (_masked_summary(0.1), True),

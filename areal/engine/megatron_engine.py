@@ -8,7 +8,7 @@ import gc
 import math
 import os
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future
 from contextlib import contextmanager
 from datetime import datetime
@@ -210,6 +210,109 @@ def _behavior_sequence_trace_stats(
         mean_log_ratio=float(metrics.mean_log_ratio.detach().item()),
         valid_response_tokens=valid_response_tokens,
     )
+
+
+class _KLK1ZScoreStats(NamedTuple):
+    mean: torch.Tensor
+    zscore: torch.Tensor
+    batch_mean: float
+    batch_std: float
+
+
+def _per_trajectory_filter_rule(filter_config: Any) -> str | None:
+    if isinstance(filter_config, Mapping):
+        rule = filter_config.get("rule")
+    else:
+        rule = getattr(filter_config, "rule", None)
+    return rule if isinstance(rule, str) else None
+
+
+def _uses_kl_k1_zscore_filter(filters: tuple[Any, ...]) -> bool:
+    return any(
+        _per_trajectory_filter_rule(filter_config) == "kl_k1_zscore_exceeds"
+        for filter_config in filters
+    )
+
+
+def _compute_kl_k1_zscore_stats(input_batched: dict[str, Any]) -> _KLK1ZScoreStats:
+    required = ("prox_logp", "logprobs", "loss_mask")
+    missing = [
+        key for key in required if not isinstance(input_batched.get(key), torch.Tensor)
+    ]
+    if missing:
+        raise RuntimeError(
+            "kl_k1_zscore_exceeds per-trajectory mask filter requires tensor fields "
+            "prox_logp, logprobs, and loss_mask; missing/non-tensor: "
+            + ", ".join(missing)
+        )
+
+    prox_logp = input_batched["prox_logp"]
+    logprobs = input_batched["logprobs"]
+    loss_mask = input_batched["loss_mask"].bool()
+    if not (prox_logp.shape == logprobs.shape == loss_mask.shape):
+        raise ValueError(
+            "prox_logp, logprobs, and loss_mask must have the same shape for "
+            "kl_k1_zscore_exceeds filtering; got "
+            f"prox_logp={tuple(prox_logp.shape)}, "
+            f"logprobs={tuple(logprobs.shape)}, "
+            f"loss_mask={tuple(loss_mask.shape)}"
+        )
+    if prox_logp.ndim != 2:
+        raise ValueError(
+            "kl_k1_zscore_exceeds filtering expects 2-D padded tensors shaped "
+            f"[batch, sequence], got ndim={prox_logp.ndim}"
+        )
+
+    token_kl = prox_logp.detach().float() - logprobs.detach().float()
+    token_kl = torch.where(
+        torch.isfinite(token_kl),
+        token_kl,
+        torch.zeros_like(token_kl),
+    )
+    valid_count = loss_mask.sum(dim=-1)
+    valid_seq = valid_count > 0
+    seq_mean = torch.full(
+        (prox_logp.shape[0],),
+        float("nan"),
+        dtype=torch.float32,
+        device=prox_logp.device,
+    )
+    if valid_seq.any():
+        seq_sum = token_kl.masked_fill(~loss_mask, 0.0).sum(dim=-1)
+        seq_mean[valid_seq] = seq_sum[valid_seq] / valid_count[valid_seq].float()
+
+    finite_seq = torch.isfinite(seq_mean)
+    zscore = torch.full_like(seq_mean, float("nan"))
+    if not finite_seq.any():
+        return _KLK1ZScoreStats(
+            mean=seq_mean,
+            zscore=zscore,
+            batch_mean=float("nan"),
+            batch_std=float("nan"),
+        )
+
+    finite_means = seq_mean[finite_seq]
+    batch_mean = finite_means.mean()
+    batch_std = finite_means.std(unbiased=False)
+    if float(batch_std.item()) <= 0.0:
+        zscore[finite_seq] = 0.0
+    else:
+        zscore[finite_seq] = (finite_means - batch_mean).abs() / batch_std
+
+    return _KLK1ZScoreStats(
+        mean=seq_mean,
+        zscore=zscore,
+        batch_mean=float(batch_mean.item()),
+        batch_std=float(batch_std.item()),
+    )
+
+
+def _finite_float_or_none(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
 
 
 class _MegatronModelList(list):
@@ -1251,6 +1354,11 @@ class MegatronEngine(TrainEngine):
             per_trajectory_mask_filters = tuple(
                 getattr(self.config.per_trajectory, "mask_filters", ()) or ()
             )
+            kl_k1_zscore_stats = (
+                _compute_kl_k1_zscore_stats(input_batched)
+                if _uses_kl_k1_zscore_filter(per_trajectory_mask_filters)
+                else None
+            )
             filters_enabled = len(per_trajectory_mask_filters) > 0
             trajectory_filter_count = 0
             for trajectory_idx in range(n_trajectories):
@@ -1367,10 +1475,31 @@ class MegatronEngine(TrainEngine):
                 advantage_summary = advantage_accum.summary()
                 behave_imp_weight_summary = behave_imp_weight_accum.summary()
                 behave_approx_kl_summary = behave_approx_kl_accum.summary()
+                kl_k1_mean = None
+                kl_k1_batch_mean = None
+                kl_k1_batch_std = None
+                kl_k1_zscore = None
+                if kl_k1_zscore_stats is not None:
+                    kl_k1_mean = _finite_float_or_none(
+                        kl_k1_zscore_stats.mean[trajectory_idx].item()
+                    )
+                    kl_k1_batch_mean = _finite_float_or_none(
+                        kl_k1_zscore_stats.batch_mean
+                    )
+                    kl_k1_batch_std = _finite_float_or_none(
+                        kl_k1_zscore_stats.batch_std
+                    )
+                    kl_k1_zscore = _finite_float_or_none(
+                        kl_k1_zscore_stats.zscore[trajectory_idx].item()
+                    )
                 filter_context = PerTrajectoryFilterContext(
                     grad_norm=float(trace_grad_norm),
                     advantage_summary=advantage_summary,
                     behave_approx_kl_summary=behave_approx_kl_summary,
+                    kl_k1_mean=kl_k1_mean,
+                    kl_k1_batch_mean=kl_k1_batch_mean,
+                    kl_k1_batch_std=kl_k1_batch_std,
+                    kl_k1_zscore=kl_k1_zscore,
                     advantage_mean_emitted=advantage_mean_emitted,
                     behave_approx_kl_mean_emitted=behave_approx_kl_mean_emitted,
                 )
@@ -1433,6 +1562,10 @@ class MegatronEngine(TrainEngine):
                         behave_approx_kl_min=behave_approx_kl_summary.min,
                         behave_approx_kl_max=behave_approx_kl_summary.max,
                         behave_approx_kl_mean=behave_approx_kl_summary.mean,
+                        kl_k1_mean=kl_k1_mean,
+                        kl_k1_batch_mean=kl_k1_batch_mean,
+                        kl_k1_batch_std=kl_k1_batch_std,
+                        kl_k1_zscore=kl_k1_zscore,
                     )
                 )
                 self.optimizer_zero_grad()
