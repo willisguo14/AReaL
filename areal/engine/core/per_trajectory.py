@@ -94,6 +94,9 @@ class PerTrajectoryRecord:
     reward: float
     response_length: int
     accepted: bool = True
+    valid_response_tokens: int | None = None
+    behave_seq_log_weight: float | None = None
+    behave_seq_mean_log_ratio: float | None = None
     entropy_mean: float | None = None
     advantage_min: float | None = None
     advantage_max: float | None = None

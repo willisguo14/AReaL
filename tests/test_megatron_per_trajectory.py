@@ -724,6 +724,8 @@ def test_train_batch_per_trajectory_uses_single_mb_spec_for_sliced_trajectories(
         "input_ids": torch.tensor([[1, 2], [3, 4]]),
         "attention_mask": torch.ones(2, 2, dtype=torch.bool),
         "loss_mask": torch.tensor([[False, True], [False, True]]),
+        "logprobs": torch.tensor([[0.0, -1.0], [0.0, -2.0]]),
+        "prox_logp": torch.tensor([[0.0, -0.5], [0.0, -3.5]]),
         "rollout_logprobs": torch.tensor([[-0.1, -0.2], [-0.3, -0.4]]),
         "rollout_loss_mask": torch.tensor([[False, True], [False, True]]),
         "task_reward": torch.tensor([1.0, 0.0]),
@@ -905,6 +907,12 @@ def test_train_batch_per_trajectory_uses_single_mb_spec_for_sliced_trajectories(
     assert [record.accepted for record in tracer.records] == [True, True]
     assert [record.reward for record in tracer.records] == [1.0, 0.0]
     assert [record.logprob_train_sum for record in tracer.records] == [-1.5, -1.5]
+    assert [record.valid_response_tokens for record in tracer.records] == [1, 1]
+    assert [record.behave_seq_log_weight for record in tracer.records] == [0.5, -1.5]
+    assert [record.behave_seq_mean_log_ratio for record in tracer.records] == [
+        0.5,
+        -1.5,
+    ]
     assert [record.entropy_mean for record in tracer.records] == [0.5, 0.5]
     assert [record.advantage_min for record in tracer.records] == [1.0, 1.0]
     assert [record.advantage_max for record in tracer.records] == [3.0, 3.0]

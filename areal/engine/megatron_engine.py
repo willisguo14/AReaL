@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from contextlib import contextmanager
 from datetime import datetime
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import mbridge
 import torch
@@ -123,6 +123,7 @@ from areal.models.tree_attn.module import (
     patch_bridge_for_tree_training,
 )
 from areal.models.tree_attn.tree import build_packed_tree_batch
+from areal.trainer.ppo.ess import compute_sequence_behavior_metrics
 from areal.utils import logging, name_resolve, names, perf_tracer, stats_tracker
 from areal.utils.constants import (
     DEFAULT_VECTORIZED_ALIGNMENT_BYTES,
@@ -167,6 +168,48 @@ def _normalize_glu_param_name(name: str) -> str:
     name = _LAYER_IDX_RE.sub(".layers.", name)
     name = _EXPERT_NUM_RE.sub(r".\1", name)
     return name
+
+
+class _BehaviorSequenceTraceStats(NamedTuple):
+    log_weight: float | None
+    mean_log_ratio: float | None
+    valid_response_tokens: int | None
+
+
+def _behavior_sequence_trace_stats(
+    batch: dict[str, Any],
+) -> _BehaviorSequenceTraceStats:
+    prox_logp = batch.get("prox_logp")
+    logprobs = batch.get("logprobs")
+    loss_mask = batch.get("loss_mask")
+    if not (
+        isinstance(prox_logp, torch.Tensor)
+        and isinstance(logprobs, torch.Tensor)
+        and isinstance(loss_mask, torch.Tensor)
+    ):
+        return _BehaviorSequenceTraceStats(
+            log_weight=None,
+            mean_log_ratio=None,
+            valid_response_tokens=None,
+        )
+    metrics = compute_sequence_behavior_metrics(
+        prox_logp=prox_logp,
+        logprobs=logprobs,
+        loss_mask=loss_mask,
+    )
+    valid_response_tokens = int(loss_mask.bool().sum().item())
+    if valid_response_tokens <= 0:
+        return _BehaviorSequenceTraceStats(
+            log_weight=None,
+            mean_log_ratio=None,
+            valid_response_tokens=0,
+        )
+
+    return _BehaviorSequenceTraceStats(
+        log_weight=float(metrics.log_weight.detach().item()),
+        mean_log_ratio=float(metrics.mean_log_ratio.detach().item()),
+        valid_response_tokens=valid_response_tokens,
+    )
 
 
 class _MegatronModelList(list):
@@ -1319,6 +1362,7 @@ class MegatronEngine(TrainEngine):
                     traj_batch["rollout_logprobs"],
                     traj_batch.get("rollout_loss_mask", traj_batch["loss_mask"]),
                 )
+                behavior_sequence_stats = _behavior_sequence_trace_stats(traj_batch)
                 entropy_summary = entropy_accum.summary()
                 advantage_summary = advantage_accum.summary()
                 behave_imp_weight_summary = behave_imp_weight_accum.summary()
@@ -1371,6 +1415,13 @@ class MegatronEngine(TrainEngine):
                         logprob_infer_mean=rollout_summary.mean,
                         reward=self._reward_from_batch(traj_batch),
                         response_length=rollout_summary.length,
+                        valid_response_tokens=(
+                            behavior_sequence_stats.valid_response_tokens
+                        ),
+                        behave_seq_log_weight=behavior_sequence_stats.log_weight,
+                        behave_seq_mean_log_ratio=(
+                            behavior_sequence_stats.mean_log_ratio
+                        ),
                         entropy_mean=entropy_summary.mean,
                         advantage_min=advantage_summary.min,
                         advantage_max=advantage_summary.max,
