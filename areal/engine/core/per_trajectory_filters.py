@@ -91,33 +91,34 @@ def _reject_extra_params(
         )
 
 
-def _validate_none(params: FilterParams) -> None:
-    _reject_extra_params("none", params, set())
-
-
-def _validate_grad_norm_max(params: FilterParams) -> None:
-    _reject_extra_params("grad_norm_max", params, {"max"})
+def _validate_grad_norm_exceeds_max(params: FilterParams) -> None:
+    _reject_extra_params("grad_norm_exceeds_max", params, {"max"})
     if "max" not in params:
         raise ValueError(
-            "grad_norm_max per-trajectory filter requires positive finite max"
+            "grad_norm_exceeds_max per-trajectory mask filter requires "
+            "positive finite max"
         )
-    max_value = _finite_float("grad_norm_max", "max", params["max"])
+    max_value = _finite_float("grad_norm_exceeds_max", "max", params["max"])
     if max_value <= 0.0:
         raise ValueError(
-            "grad_norm_max per-trajectory filter max must be positive and finite"
+            "grad_norm_exceeds_max per-trajectory mask filter max must be "
+            "positive and finite"
         )
 
 
-def _validate_kl_k1_range(params: FilterParams) -> None:
-    _reject_extra_params("kl_k1_range", params, {"lower", "upper"})
-    lower = _optional_bound("kl_k1_range", params, "lower")
-    upper = _optional_bound("kl_k1_range", params, "upper")
+def _validate_kl_k1_outside_range(params: FilterParams) -> None:
+    _reject_extra_params("kl_k1_outside_range", params, {"lower", "upper"})
+    lower = _optional_bound("kl_k1_outside_range", params, "lower")
+    upper = _optional_bound("kl_k1_outside_range", params, "upper")
     if lower is None and upper is None:
         raise ValueError(
-            "kl_k1_range per-trajectory filter requires lower, upper, or both"
+            "kl_k1_outside_range per-trajectory mask filter requires lower, "
+            "upper, or both"
         )
     if lower is not None and upper is not None and lower > upper:
-        raise ValueError("kl_k1_range per-trajectory filter lower cannot exceed upper")
+        raise ValueError(
+            "kl_k1_outside_range per-trajectory mask filter lower cannot exceed upper"
+        )
 
 
 def _validate_advantage_mean_positive(params: FilterParams) -> None:
@@ -148,24 +149,16 @@ def _summary_mean(
     return _finite_context_float(summary.mean)
 
 
-def _always_accept(
+def _grad_norm_exceeds_max(
     params: FilterParams,
     context: PerTrajectoryFilterContext,
 ) -> bool:
-    del params, context
-    return True
-
-
-def _grad_norm_max(
-    params: FilterParams,
-    context: PerTrajectoryFilterContext,
-) -> bool:
-    max_value = _finite_float("grad_norm_max", "max", params["max"])
+    max_value = _finite_float("grad_norm_exceeds_max", "max", params["max"])
     grad_norm = _finite_context_float(context.grad_norm)
-    return grad_norm is not None and grad_norm <= max_value
+    return grad_norm is None or grad_norm > max_value
 
 
-def _kl_k1_range(
+def _kl_k1_outside_range(
     params: FilterParams,
     context: PerTrajectoryFilterContext,
 ) -> bool:
@@ -177,13 +170,13 @@ def _kl_k1_range(
     if mean is None:
         return False
 
-    lower = _optional_bound("kl_k1_range", params, "lower")
-    upper = _optional_bound("kl_k1_range", params, "upper")
+    lower = _optional_bound("kl_k1_outside_range", params, "lower")
+    upper = _optional_bound("kl_k1_outside_range", params, "upper")
     if lower is not None and mean < lower:
-        return False
+        return True
     if upper is not None and mean > upper:
-        return False
-    return True
+        return True
+    return False
 
 
 def _advantage_mean_positive(
@@ -200,16 +193,14 @@ def _advantage_mean_positive(
 
 
 PER_TRAJECTORY_FILTER_RULES: dict[str, FilterFn] = {
-    "none": _always_accept,
-    "grad_norm_max": _grad_norm_max,
-    "kl_k1_range": _kl_k1_range,
+    "grad_norm_exceeds_max": _grad_norm_exceeds_max,
+    "kl_k1_outside_range": _kl_k1_outside_range,
     "advantage_mean_positive": _advantage_mean_positive,
 }
 
 _VALIDATORS: dict[str, ValidatorFn] = {
-    "none": _validate_none,
-    "grad_norm_max": _validate_grad_norm_max,
-    "kl_k1_range": _validate_kl_k1_range,
+    "grad_norm_exceeds_max": _validate_grad_norm_exceeds_max,
+    "kl_k1_outside_range": _validate_kl_k1_outside_range,
     "advantage_mean_positive": _validate_advantage_mean_positive,
 }
 
@@ -219,11 +210,13 @@ def validate_per_trajectory_filter_config(config: Any) -> None:
     _VALIDATORS[rule](params)
 
 
-def evaluate_per_trajectory_filters(
-    filters: Sequence[Any],
+def evaluate_per_trajectory_mask_filters(
+    mask_filters: Sequence[Any],
     context: PerTrajectoryFilterContext,
 ) -> bool:
-    for filter_config in filters:
+    if not mask_filters:
+        return False
+    for filter_config in mask_filters:
         rule, params = _filter_rule_and_params(filter_config)
         _VALIDATORS[rule](params)
         if not PER_TRAJECTORY_FILTER_RULES[rule](params, context):

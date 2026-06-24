@@ -22,7 +22,7 @@ from areal.engine.core.per_trajectory import (
 )
 from areal.engine.core.per_trajectory_filters import (
     PerTrajectoryFilterContext,
-    evaluate_per_trajectory_filters,
+    evaluate_per_trajectory_mask_filters,
 )
 
 
@@ -93,40 +93,30 @@ def test_core_package_reexports_normalize_flush_threshold():
     assert exported("4") == 4
 
 
-def test_evaluate_per_trajectory_filters_empty_list_accepts():
-    assert evaluate_per_trajectory_filters([], _filter_context(grad_norm=float("nan")))
-
-
-def test_evaluate_per_trajectory_filters_none_rule_accepts():
-    assert evaluate_per_trajectory_filters(
-        [SimpleNamespace(rule="none", params={})],
-        _filter_context(),
+def test_evaluate_per_trajectory_mask_filters_empty_list_masks_nothing():
+    assert not evaluate_per_trajectory_mask_filters(
+        [],
+        _filter_context(grad_norm=float("nan")),
     )
-
-
-@pytest.mark.parametrize("params", [{"unexpected": 1}, {1: "unexpected"}])
-def test_evaluate_per_trajectory_filters_none_rule_rejects_params(params):
-    with pytest.raises(ValueError, match="none.*does not accept params"):
-        evaluate_per_trajectory_filters(
-            [SimpleNamespace(rule="none", params=params)],
-            _filter_context(),
-        )
 
 
 @pytest.mark.parametrize(
     ("grad_norm", "expected"),
     [
-        (2.0, True),
-        (2.5, True),
-        (2.6, False),
-        (float("inf"), False),
-        (float("nan"), False),
+        (2.0, False),
+        (2.5, False),
+        (2.6, True),
+        (float("inf"), True),
+        (float("nan"), True),
     ],
 )
-def test_evaluate_per_trajectory_filters_grad_norm_max(grad_norm, expected):
+def test_evaluate_per_trajectory_mask_filters_grad_norm_exceeds_max(
+    grad_norm,
+    expected,
+):
     assert (
-        evaluate_per_trajectory_filters(
-            [SimpleNamespace(rule="grad_norm_max", params={"max": 2.5})],
+        evaluate_per_trajectory_mask_filters(
+            [SimpleNamespace(rule="grad_norm_exceeds_max", params={"max": 2.5})],
             _filter_context(grad_norm=grad_norm),
         )
         is expected
@@ -136,17 +126,22 @@ def test_evaluate_per_trajectory_filters_grad_norm_max(grad_norm, expected):
 @pytest.mark.parametrize(
     ("mean", "params", "expected"),
     [
-        (0.1, {"lower": 0.0}, True),
-        (-0.1, {"lower": 0.0}, False),
-        (0.1, {"upper": 0.2}, True),
-        (0.3, {"upper": 0.2}, False),
-        (0.1, {"lower": 0.0, "upper": 0.2}, True),
+        (0.1, {"lower": 0.0}, False),
+        (-0.1, {"lower": 0.0}, True),
+        (0.1, {"upper": 0.2}, False),
+        (0.3, {"upper": 0.2}, True),
+        (0.1, {"lower": 0.0, "upper": 0.2}, False),
+        (0.3, {"lower": 0.0, "upper": 0.2}, True),
     ],
 )
-def test_evaluate_per_trajectory_filters_kl_k1_range(mean, params, expected):
+def test_evaluate_per_trajectory_mask_filters_kl_k1_outside_range(
+    mean,
+    params,
+    expected,
+):
     assert (
-        evaluate_per_trajectory_filters(
-            [SimpleNamespace(rule="kl_k1_range", params=params)],
+        evaluate_per_trajectory_mask_filters(
+            [SimpleNamespace(rule="kl_k1_outside_range", params=params)],
             _filter_context(
                 behave_approx_kl_summary=_masked_summary(mean),
                 behave_approx_kl_mean_emitted=True,
@@ -156,17 +151,17 @@ def test_evaluate_per_trajectory_filters_kl_k1_range(mean, params, expected):
     )
 
 
-def test_evaluate_per_trajectory_filters_kl_k1_range_requires_emitted_summary():
+def test_evaluate_per_trajectory_mask_filters_kl_k1_outside_range_requires_emitted_summary():
     with pytest.raises(RuntimeError, match="behave_approx_kl_mean"):
-        evaluate_per_trajectory_filters(
-            [SimpleNamespace(rule="kl_k1_range", params={"upper": 0.2})],
+        evaluate_per_trajectory_mask_filters(
+            [SimpleNamespace(rule="kl_k1_outside_range", params={"upper": 0.2})],
             _filter_context(behave_approx_kl_summary=_masked_summary(0.1)),
         )
 
 
-def test_evaluate_per_trajectory_filters_kl_k1_range_rejects_empty_summary():
-    assert not evaluate_per_trajectory_filters(
-        [SimpleNamespace(rule="kl_k1_range", params={"upper": 0.2})],
+def test_evaluate_per_trajectory_mask_filters_kl_k1_outside_range_does_not_mask_empty_summary():
+    assert not evaluate_per_trajectory_mask_filters(
+        [SimpleNamespace(rule="kl_k1_outside_range", params={"upper": 0.2})],
         _filter_context(
             behave_approx_kl_summary=_masked_summary(None, count=0),
             behave_approx_kl_mean_emitted=True,
@@ -183,9 +178,12 @@ def test_evaluate_per_trajectory_filters_kl_k1_range_rejects_empty_summary():
         (_masked_summary(None, count=0), False),
     ],
 )
-def test_evaluate_per_trajectory_filters_advantage_mean_positive(summary, expected):
+def test_evaluate_per_trajectory_mask_filters_advantage_mean_positive(
+    summary,
+    expected,
+):
     assert (
-        evaluate_per_trajectory_filters(
+        evaluate_per_trajectory_mask_filters(
             [SimpleNamespace(rule="advantage_mean_positive", params={})],
             _filter_context(
                 advantage_summary=summary,
@@ -196,33 +194,76 @@ def test_evaluate_per_trajectory_filters_advantage_mean_positive(summary, expect
     )
 
 
-def test_evaluate_per_trajectory_filters_advantage_mean_positive_requires_emitted_summary():
+def test_evaluate_per_trajectory_mask_filters_advantage_mean_positive_requires_emitted_summary():
     with pytest.raises(RuntimeError, match="advantage_mean"):
-        evaluate_per_trajectory_filters(
+        evaluate_per_trajectory_mask_filters(
             [SimpleNamespace(rule="advantage_mean_positive", params={})],
             _filter_context(advantage_summary=_masked_summary(0.1)),
         )
 
 
-def test_evaluate_per_trajectory_filters_and_composes_rules():
-    assert not evaluate_per_trajectory_filters(
+def test_evaluate_per_trajectory_mask_filters_and_composes_rules():
+    assert not evaluate_per_trajectory_mask_filters(
         [
-            SimpleNamespace(rule="none", params={}),
-            SimpleNamespace(rule="grad_norm_max", params={"max": 2.0}),
+            SimpleNamespace(rule="kl_k1_outside_range", params={"upper": 0.2}),
             SimpleNamespace(rule="advantage_mean_positive", params={}),
         ],
         _filter_context(
-            grad_norm=2.5,
+            behave_approx_kl_summary=_masked_summary(0.1),
+            behave_approx_kl_mean_emitted=True,
+            advantage_summary=_masked_summary(0.1),
+            advantage_mean_emitted=True,
+        ),
+    )
+    assert evaluate_per_trajectory_mask_filters(
+        [
+            SimpleNamespace(rule="kl_k1_outside_range", params={"upper": 0.2}),
+            SimpleNamespace(rule="advantage_mean_positive", params={}),
+        ],
+        _filter_context(
+            behave_approx_kl_summary=_masked_summary(0.3),
+            behave_approx_kl_mean_emitted=True,
             advantage_summary=_masked_summary(0.1),
             advantage_mean_emitted=True,
         ),
     )
 
 
-def test_evaluate_per_trajectory_filters_accepts_mapping_configs():
-    assert evaluate_per_trajectory_filters(
-        [{"rule": "grad_norm_max", "params": {"max": 2.0}}],
-        _filter_context(grad_norm=1.5),
+@pytest.mark.parametrize(
+    ("kl_mean", "advantage_mean", "expected_masked"),
+    [
+        (0.3, 0.1, True),
+        (0.3, -0.1, False),
+        (0.1, 0.1, False),
+        (0.1, -0.1, False),
+    ],
+)
+def test_evaluate_per_trajectory_mask_filters_masks_only_outside_kl_with_positive_advantage(
+    kl_mean,
+    advantage_mean,
+    expected_masked,
+):
+    assert (
+        evaluate_per_trajectory_mask_filters(
+            [
+                SimpleNamespace(rule="kl_k1_outside_range", params={"upper": 0.2}),
+                SimpleNamespace(rule="advantage_mean_positive", params={}),
+            ],
+            _filter_context(
+                behave_approx_kl_summary=_masked_summary(kl_mean),
+                behave_approx_kl_mean_emitted=True,
+                advantage_summary=_masked_summary(advantage_mean),
+                advantage_mean_emitted=True,
+            ),
+        )
+        is expected_masked
+    )
+
+
+def test_evaluate_per_trajectory_mask_filters_accepts_mapping_configs():
+    assert evaluate_per_trajectory_mask_filters(
+        [{"rule": "grad_norm_exceeds_max", "params": {"max": 2.0}}],
+        _filter_context(grad_norm=2.5),
     )
 
 

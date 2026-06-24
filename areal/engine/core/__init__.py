@@ -18,7 +18,7 @@ from areal.engine.core.per_trajectory import (
 )
 from areal.engine.core.per_trajectory_filters import (
     PerTrajectoryFilterContext,
-    evaluate_per_trajectory_filters,
+    evaluate_per_trajectory_mask_filters,
     validate_per_trajectory_filter_config,
 )
 from areal.engine.core.train_engine import (
@@ -45,7 +45,7 @@ __all__ = [
     "PerTrajectoryRecord",
     "PerTrajectoryTracer",
     "attach_trainer_step_metadata",
-    "evaluate_per_trajectory_filters",
+    "evaluate_per_trajectory_mask_filters",
     "normalize_flush_threshold",
     "per_trajectory_log_dir",
     "preserve_rollout_logprobs",

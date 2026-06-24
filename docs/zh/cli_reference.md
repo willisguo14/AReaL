@@ -1131,22 +1131,22 @@ entries for torch.cuda.memory.\_record_memory_history.
 
 Configuration for exact per-trajectory actor gradient tracing.
 
-| Parameter         | Type                                                                 | Default      | Description                                                                                           |
-| ----------------- | -------------------------------------------------------------------- | ------------ | ----------------------------------------------------------------------------------------------------- |
-| `enabled`         | boolean                                                              | `False`      | Enable exact per-trajectory actor gradient tracing.                                                   |
-| `flush_threshold` | integer                                                              | `256`        | Flush per-trajectory JSONL records once this many entries are buffered. Values \<= 0 fall back to 1.  |
-| `filters`         | list of [`PerTrajectoryFilterConfig`](section-per-trajectory-filter) | **Required** | Post-backward per-trajectory filters. Rules are AND-composed; an empty list accepts every trajectory. |
+| Parameter         | Type                                                                 | Default      | Description                                                                                             |
+| ----------------- | -------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------- |
+| `enabled`         | boolean                                                              | `False`      | Enable exact per-trajectory actor gradient tracing.                                                     |
+| `flush_threshold` | integer                                                              | `256`        | Flush per-trajectory JSONL records once this many entries are buffered. Values \<= 0 fall back to 1.    |
+| `mask_filters`    | list of [`PerTrajectoryFilterConfig`](section-per-trajectory-filter) | **Required** | Post-backward per-trajectory mask filters. Rules are AND-composed; an empty list masks no trajectories. |
 
 (section-per-trajectory-filter)=
 
 ## PerTrajectoryFilter Configuration
 
-Configuration for one built-in post-backward per-trajectory filter.
+Configuration for one built-in post-backward per-trajectory mask filter.
 
-| Parameter | Type   | Default      | Description                                                                                                      |
-| --------- | ------ | ------------ | ---------------------------------------------------------------------------------------------------------------- |
-| `rule`    | string | **Required** | Built-in per-trajectory filter rule. Supported rules: none, grad_norm_max, kl_k1_range, advantage_mean_positive. |
-| `params`  | `dict` | **Required** | Rule-specific parameters. Each built-in rule validates its own accepted keys and value constraints.              |
+| Parameter | Type   | Default      | Description                                                                                                                     |
+| --------- | ------ | ------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| `rule`    | string | **Required** | Built-in per-trajectory mask filter rule. Supported rules: grad_norm_exceeds_max, kl_k1_outside_range, advantage_mean_positive. |
+| `params`  | `dict` | **Required** | Rule-specific parameters. Each built-in mask rule validates its own accepted keys and value constraints.                        |
 
 (section-perf-tracer)=
 

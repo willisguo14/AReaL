@@ -384,7 +384,7 @@ def _engine_stub(**overrides):
         per_trajectory=SimpleNamespace(
             enabled=True,
             flush_threshold=256,
-            filters=[],
+            mask_filters=[],
         ),
     )
     engine.parallel_strategy = SimpleNamespace(
@@ -512,8 +512,11 @@ def _setup_per_trajectory_filter_fixture(
     )
     engine = _engine_stub()
     engine.config.mb_spec = mb_spec
-    engine.config.per_trajectory.filters = [
-        SimpleNamespace(rule="grad_norm_max", params={"max": grad_norm_limit})
+    engine.config.per_trajectory.mask_filters = [
+        SimpleNamespace(
+            rule="grad_norm_exceeds_max",
+            params={"max": grad_norm_limit},
+        )
     ]
     engine.config.pad_to_maximum = False
     engine.device = torch.device("cpu")
@@ -941,8 +944,8 @@ def test_train_batch_per_trajectory_filters_over_threshold_grad_norm(monkeypatch
     )
     engine = _engine_stub()
     engine.config.mb_spec = mb_spec
-    engine.config.per_trajectory.filters = [
-        SimpleNamespace(rule="grad_norm_max", params={"max": 3.0})
+    engine.config.per_trajectory.mask_filters = [
+        SimpleNamespace(rule="grad_norm_exceeds_max", params={"max": 3.0})
     ]
     engine.config.pad_to_maximum = False
     engine.device = torch.device("cpu")
@@ -1165,7 +1168,7 @@ def test_train_batch_per_trajectory_passes_optimizer_step_scale(monkeypatch):
     assert ("optimizer_step", 0.4) in events
 
 
-def test_train_batch_per_trajectory_and_composes_processed_summary_filters(
+def test_train_batch_per_trajectory_and_composes_processed_summary_mask_filters(
     monkeypatch,
 ):
     torch = megatron_engine.torch
@@ -1173,8 +1176,8 @@ def test_train_batch_per_trajectory_and_composes_processed_summary_filters(
         monkeypatch,
         grad_norms=[2.0, 2.0],
     )
-    engine.config.per_trajectory.filters = [
-        SimpleNamespace(rule="grad_norm_max", params={"max": 3.0}),
+    engine.config.per_trajectory.mask_filters = [
+        SimpleNamespace(rule="kl_k1_outside_range", params={"upper": 0.2}),
         SimpleNamespace(rule="advantage_mean_positive", params={}),
     ]
     trajectory_seen = {"idx": 0}
@@ -1212,7 +1215,10 @@ def test_train_batch_per_trajectory_and_composes_processed_summary_filters(
                     "loss_advantage": advantage,
                     "behave_mask": torch.tensor([[True, True]], dtype=torch.bool),
                     "behave_imp_weight": torch.tensor([[1.0, 3.0]]),
-                    "behave_approx_kl": torch.tensor([[-0.5, 0.25]]),
+                    "behave_approx_kl": torch.tensor(
+                        [[0.3, 0.5]],
+                        dtype=torch.float32,
+                    ),
                 }
             )
         return output.sum()
@@ -1228,7 +1234,7 @@ def test_train_batch_per_trajectory_and_composes_processed_summary_filters(
     assert [event for event in events if event[0] == "accumulate"] == [
         ("accumulate", ("accum",)),
     ]
-    assert [record.accepted for record in tracer.records] == [True, False]
+    assert [record.accepted for record in tracer.records] == [False, True]
     assert [record.advantage_mean for record in tracer.records] == [2.0, -2.0]
     assert stats["trajectory_filter_count"] == pytest.approx(1.0)
     assert stats["trajectory_filter_fraction"] == pytest.approx(0.5)

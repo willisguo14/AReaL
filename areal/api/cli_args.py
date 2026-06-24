@@ -1492,13 +1492,14 @@ class ESSScalingConfig:
 
 @dataclass
 class PerTrajectoryFilterConfig:
-    """Configuration for one built-in post-backward per-trajectory filter."""
+    """Configuration for one built-in post-backward per-trajectory mask filter."""
 
     rule: str = field(
         metadata={
             "help": (
-                "Built-in per-trajectory filter rule. Supported rules: "
-                "none, grad_norm_max, kl_k1_range, advantage_mean_positive."
+                "Built-in per-trajectory mask filter rule. Supported rules: "
+                "grad_norm_exceeds_max, kl_k1_outside_range, "
+                "advantage_mean_positive."
             )
         }
     )
@@ -1506,8 +1507,8 @@ class PerTrajectoryFilterConfig:
         default_factory=dict,
         metadata={
             "help": (
-                "Rule-specific parameters. Each built-in rule validates its own "
-                "accepted keys and value constraints."
+                "Rule-specific parameters. Each built-in mask rule validates "
+                "its own accepted keys and value constraints."
             )
         },
     )
@@ -1537,12 +1538,12 @@ class PerTrajectoryConfig:
             )
         },
     )
-    filters: list[PerTrajectoryFilterConfig] = field(
+    mask_filters: list[PerTrajectoryFilterConfig] = field(
         default_factory=list,
         metadata={
             "help": (
-                "Post-backward per-trajectory filters. Rules are AND-composed; "
-                "an empty list accepts every trajectory."
+                "Post-backward per-trajectory mask filters. Rules are "
+                "AND-composed; an empty list masks no trajectories."
             )
         },
     )
@@ -1552,13 +1553,13 @@ class PerTrajectoryConfig:
             validate_per_trajectory_filter_config,
         )
 
-        if not isinstance(self.filters, Sequence) or isinstance(
-            self.filters, (str, bytes)
+        if not isinstance(self.mask_filters, Sequence) or isinstance(
+            self.mask_filters, (str, bytes)
         ):
             raise ValueError(
-                "actor.per_trajectory.filters must be a sequence of filter configs"
+                "actor.per_trajectory.mask_filters must be a sequence of filter configs"
             )
-        for filter_config in self.filters:
+        for filter_config in self.mask_filters:
             validate_per_trajectory_filter_config(filter_config)
 
 

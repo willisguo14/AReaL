@@ -55,7 +55,7 @@ from areal.engine.core import (
     PerTrajectoryTracer,
     aggregate_eval_losses,
     compute_total_loss_weight,
-    evaluate_per_trajectory_filters,
+    evaluate_per_trajectory_mask_filters,
     per_trajectory_log_dir,
     reorder_and_pad_outputs,
     slice_trajectory,
@@ -1248,10 +1248,10 @@ class MegatronEngine(TrainEngine):
                 n_mbs_divisor=1,
             )
             n_trajectories = int(input_batched["attention_mask"].shape[0])
-            per_trajectory_filters = tuple(
-                getattr(self.config.per_trajectory, "filters", ()) or ()
+            per_trajectory_mask_filters = tuple(
+                getattr(self.config.per_trajectory, "mask_filters", ()) or ()
             )
-            filters_enabled = len(per_trajectory_filters) > 0
+            filters_enabled = len(per_trajectory_mask_filters) > 0
             trajectory_filter_count = 0
             for trajectory_idx in range(n_trajectories):
                 traj_batch = slice_trajectory(input_batched, trajectory_idx)
@@ -1374,10 +1374,11 @@ class MegatronEngine(TrainEngine):
                     advantage_mean_emitted=advantage_mean_emitted,
                     behave_approx_kl_mean_emitted=behave_approx_kl_mean_emitted,
                 )
-                accepted = evaluate_per_trajectory_filters(
-                    per_trajectory_filters,
+                masked = evaluate_per_trajectory_mask_filters(
+                    per_trajectory_mask_filters,
                     filter_context,
                 )
+                accepted = not masked
                 if accepted:
                     accumulate_grad_buffers(self.model, accum_buffers)
                     if (
