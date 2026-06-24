@@ -470,7 +470,7 @@ class PPOActor:
             self.engine, "supports_optimizer_step_scale", False
         ):
             raise RuntimeError(
-                "ess_scaling requires an FSDP engine that supports "
+                "ess_scaling requires a train engine that supports "
                 "optimizer_step_scale."
             )
         data_parallel_group = getattr(self.engine, "data_parallel_group", None)

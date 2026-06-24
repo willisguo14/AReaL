@@ -847,7 +847,7 @@ def test_ppo_update_raises_when_scaling_enabled_for_unsupported_engine(monkeypat
         supports_optimizer_step_scale=False,
     )
 
-    with pytest.raises(RuntimeError, match="FSDP"):
+    with pytest.raises(RuntimeError, match="optimizer_step_scale"):
         actor._ppo_update(_make_data())
 
 

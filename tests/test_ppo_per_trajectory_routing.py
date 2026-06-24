@@ -4,7 +4,7 @@ from unittest.mock import ANY, MagicMock, call
 import pytest
 import torch
 
-from areal.api.cli_args import PerTrajectoryConfig, PPOActorConfig
+from areal.api.cli_args import ESSScalingConfig, PerTrajectoryConfig, PPOActorConfig
 from areal.trainer.ppo import actor as actor_module
 from areal.trainer.ppo.actor import PPOActor
 
@@ -163,6 +163,31 @@ def test_per_trajectory_enabled_uses_replacement_path(monkeypatch):
     ]
     assert {"lr": 2.0} in recorder.scalar_calls
     assert {"lr": 3.0} in recorder.scalar_calls
+
+
+def test_per_trajectory_ess_scaling_passes_optimizer_step_scale(monkeypatch):
+    recorder = _StatsRecorder()
+    monkeypatch.setattr(actor_module, "stats_tracker", recorder)
+    engine = _FakeEngine(per_trajectory_stats=[{"lr": 0.01}])
+    engine.supports_optimizer_step_scale = True
+    actor = PPOActor(
+        PPOActorConfig(
+            disable_dropout=True,
+            use_decoupled_loss=True,
+            ppo_n_minibatches=1,
+            per_trajectory=PerTrajectoryConfig(enabled=True),
+            ess_scaling=ESSScalingConfig(),
+        ),
+        engine,
+    )
+
+    actor._ppo_update(_minimal_batch(batch_size=2))
+
+    engine.train_batch.assert_not_called()
+    engine.train_batch_per_trajectory.assert_called_once()
+    assert engine.train_batch_per_trajectory.call_args.kwargs[
+        "optimizer_step_scale"
+    ] == pytest.approx(1.0)
 
 
 def test_per_trajectory_metadata_reordered_with_minibatch_indices(monkeypatch):

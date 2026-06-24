@@ -118,7 +118,9 @@ class FakeTrainEngine(TrainEngine):
     def optimizer_zero_grad(self):
         self._zero_grad_calls += 1
 
-    def optimizer_step(self):
+    def optimizer_step(self, optimizer_step_scale: float = 1.0):
+        if optimizer_step_scale != 1.0:
+            raise RuntimeError("FakeTrainEngine does not support optimizer_step_scale.")
         self._optimizer_step_calls += 1
         return {
             "update_successful": 1.0,
@@ -142,7 +144,10 @@ class FakeTrainEngine(TrainEngine):
         input_: dict[str, Any],
         loss_fn=None,
         loss_weight_fn=None,
+        optimizer_step_scale: float = 1.0,
     ) -> dict[str, float]:
+        if optimizer_step_scale != 1.0:
+            raise RuntimeError("FakeTrainEngine does not support optimizer_step_scale.")
         return {
             "total": _sum_numbers(input_),
             "version": float(self._version),

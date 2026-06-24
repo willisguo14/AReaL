@@ -317,8 +317,13 @@ class TrainEngine(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    def optimizer_step(self):
+    def optimizer_step(self, optimizer_step_scale: float = 1.0):
         """Perform a single optimization step.
+
+        Parameters
+        ----------
+        optimizer_step_scale : float, optional
+            Transient learning-rate multiplier for this optimizer step.
 
         Returns
         -------
@@ -367,6 +372,7 @@ class TrainEngine(abc.ABC):
         input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        optimizer_step_scale: float = 1.0,
         collect_logprob_grad_stats: bool = False,
     ) -> dict[str, float]:
         """Update the model with a batch of data and a loss function.
@@ -391,6 +397,9 @@ class TrainEngine(abc.ABC):
             loss_fn normalizes the loss for a micro-batch, we need a corresponding
             weight for each micro-batch to normalize the loss globally. The weight
             is usually the number of response tokens in the batch.
+        optimizer_step_scale : float, optional
+            Transient learning-rate multiplier for this optimizer step. Engines
+            with ``supports_optimizer_step_scale=True`` must apply non-1 values.
         collect_logprob_grad_stats : bool, optional
             If True for actor training, return diagnostics for the gradient of the
             scaled loss with respect to current policy log-probabilities.

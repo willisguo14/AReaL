@@ -8,6 +8,7 @@ different training engine implementations (FSDP, Megatron, etc.).
 
 import math
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -29,11 +30,44 @@ __all__ = [
     "compute_total_loss_weight",
     "aggregate_eval_losses",
     "reorder_and_pad_outputs",
+    "temporary_optimizer_lr_scale",
+    "validate_optimizer_step_scale",
 ]
 
 
 LOGP_GRAD_NORM_KEY = "logp_grad_norm"
 LOGP_GRAD_ABSMAX_KEY = "logp_grad_absmax"
+
+
+def validate_optimizer_step_scale(optimizer_step_scale: float) -> float:
+    try:
+        scale = float(optimizer_step_scale)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"optimizer_step_scale must be a finite non-negative value, "
+            f"got {optimizer_step_scale}"
+        ) from exc
+    if not math.isfinite(scale) or scale < 0.0:
+        raise ValueError(
+            f"optimizer_step_scale must be a finite non-negative value, "
+            f"got {optimizer_step_scale}"
+        )
+    return scale
+
+
+@contextmanager
+def temporary_optimizer_lr_scale(optimizer: Any, optimizer_step_scale: float):
+    scale = validate_optimizer_step_scale(optimizer_step_scale)
+    param_groups = list(optimizer.param_groups)
+    base_lrs = [group["lr"] for group in param_groups]
+    try:
+        if scale != 1.0:
+            for group, base_lr in zip(param_groups, base_lrs, strict=True):
+                group["lr"] = base_lr * scale
+        yield
+    finally:
+        for group, base_lr in zip(param_groups, base_lrs, strict=True):
+            group["lr"] = base_lr
 
 
 @dataclass(frozen=True)

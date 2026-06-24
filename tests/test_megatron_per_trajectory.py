@@ -201,6 +201,160 @@ def test_train_batch_per_trajectory_method_exists():
     assert hasattr(MegatronEngine, "train_batch_per_trajectory")
 
 
+def test_megatron_engine_declares_optimizer_step_scale_support():
+    assert MegatronEngine.supports_optimizer_step_scale is True
+
+
+class _GetterOnlyParamGroupsOptimizer:
+    def __init__(self, lrs=(0.01, 0.02), *, raise_on_step=False):
+        self._param_groups = [{"lr": lr} for lr in lrs]
+        self.raise_on_step = raise_on_step
+        self.step_lrs = []
+        self.step_calls = 0
+
+    @property
+    def param_groups(self):
+        return list(self._param_groups)
+
+    def step(self):
+        self.step_calls += 1
+        self.step_lrs.append([group["lr"] for group in self.param_groups])
+        if self.raise_on_step:
+            raise RuntimeError("step failed")
+        return True, 3.0, 0
+
+
+class _FakeMBList:
+    def __init__(self):
+        torch = megatron_engine.torch
+        self.mbs = [{"loss_mask": torch.ones(1, dtype=torch.bool)}]
+        self.max_seqlen = 1
+
+    def to(self, device):
+        return self
+
+    def __len__(self):
+        return len(self.mbs)
+
+
+def test_optimizer_step_scales_lr_only_during_megatron_step():
+    optimizer = _GetterOnlyParamGroupsOptimizer()
+    engine = object.__new__(MegatronEngine)
+    engine.optimizer = optimizer
+
+    stats = MegatronEngine.optimizer_step(engine, optimizer_step_scale=0.25)
+
+    assert optimizer.step_calls == 1
+    assert optimizer.step_lrs == [[pytest.approx(0.0025), pytest.approx(0.005)]]
+    assert [group["lr"] for group in optimizer.param_groups] == [
+        pytest.approx(0.01),
+        pytest.approx(0.02),
+    ]
+    assert stats["update_successful"] == 1.0
+    assert stats["grad_norm"] == pytest.approx(3.0)
+    assert stats["lr"] == pytest.approx(0.01)
+
+
+def test_optimizer_step_restores_lr_when_megatron_step_raises():
+    optimizer = _GetterOnlyParamGroupsOptimizer(raise_on_step=True)
+    engine = object.__new__(MegatronEngine)
+    engine.optimizer = optimizer
+
+    with pytest.raises(RuntimeError, match="step failed"):
+        MegatronEngine.optimizer_step(engine, optimizer_step_scale=0.25)
+
+    assert optimizer.step_calls == 1
+    assert optimizer.step_lrs == [[pytest.approx(0.0025), pytest.approx(0.005)]]
+    assert [group["lr"] for group in optimizer.param_groups] == [
+        pytest.approx(0.01),
+        pytest.approx(0.02),
+    ]
+
+
+def test_train_batch_passes_optimizer_step_scale(monkeypatch):
+    torch = megatron_engine.torch
+    events = []
+    received_optimizer_step_scales = []
+    engine = object.__new__(MegatronEngine)
+    fake_mb_list = _FakeMBList()
+
+    class _NoopTracker:
+        def prepare(self, **kwargs):
+            events.append("prepare")
+            return "pending"
+
+        def finalize(self, pending, *, update_successful):
+            events.append("finalize")
+            assert pending == "pending"
+            assert update_successful is True
+            return None
+
+    engine.config = SimpleNamespace(is_critic=False)
+    engine.device = "cpu"
+    engine.model = object()
+    engine.optimizer = SimpleNamespace(get_loss_scale=lambda: torch.tensor(1.0))
+    engine._cached_duplicated_param_names = set()
+    engine.grad_cosine_tracker = _NoopTracker()
+    engine._ensure_ready = lambda: events.append("ensure")
+    engine.optimizer_zero_grad = lambda: events.append("zero_grad")
+    engine._normalize_batch_input = lambda input_: (input_, None)
+    engine._prepare_mb_list = lambda input_: fake_mb_list
+    engine.forward_backward_batch = (
+        lambda mb_list, process_output, forward_only=False: events.append(
+            "forward_backward"
+        )
+    )
+
+    def fake_optimizer_step(*, optimizer_step_scale=1.0):
+        events.append("optimizer_step")
+        received_optimizer_step_scales.append(optimizer_step_scale)
+        return {"update_successful": 1.0, "grad_norm": 1.0, "lr": 0.01}
+
+    engine.optimizer_step = fake_optimizer_step
+    monkeypatch.setattr(
+        megatron_engine.mpu,
+        "get_data_parallel_group",
+        lambda *args, **kwargs: "dp_group",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        megatron_engine.mpu,
+        "get_data_parallel_world_size",
+        lambda: 1,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        megatron_engine.mpu,
+        "get_context_parallel_world_size",
+        lambda: 1,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        megatron_engine,
+        "compute_total_loss_weight",
+        lambda mb_list, loss_weight_fn, group: torch.tensor(1.0),
+    )
+
+    stats = MegatronEngine.train_batch(
+        engine,
+        {"loss_mask": torch.ones(1, dtype=torch.bool)},
+        loss_fn=lambda *args: torch.tensor(0.0),
+        loss_weight_fn=lambda mb: mb["loss_mask"].count_nonzero(),
+        optimizer_step_scale=0.4,
+    )
+
+    assert events == [
+        "ensure",
+        "zero_grad",
+        "forward_backward",
+        "prepare",
+        "optimizer_step",
+        "finalize",
+    ]
+    assert received_optimizer_step_scales == [0.4]
+    assert stats["num_micro_batches"] == 1
+
+
 def test_restore_modules_preserves_restored_parent_child_attribute(monkeypatch):
     parent = types.ModuleType("megatron")
     child = types.ModuleType("megatron.core")
@@ -448,7 +602,7 @@ def _setup_per_trajectory_filter_fixture(
     monkeypatch.setattr(
         engine,
         "optimizer_step",
-        lambda: events.append(("optimizer_step",))
+        lambda *, optimizer_step_scale=1.0: events.append(("optimizer_step",))
         or {"update_successful": 1.0, "grad_norm": 5.0, "lr": 0.01},
     )
     monkeypatch.setattr(engine, "_make_per_trajectory_tracer", lambda _input: tracer)
@@ -524,13 +678,20 @@ def _setup_per_trajectory_filter_fixture(
     return engine, input_batched, tracer, events
 
 
-def _train_per_trajectory_fixture(engine, input_batched, *, collect_logprob=False):
+def _train_per_trajectory_fixture(
+    engine,
+    input_batched,
+    *,
+    collect_logprob=False,
+    optimizer_step_scale=1.0,
+):
     torch = megatron_engine.torch
     return engine.train_batch_per_trajectory(
         input_batched,
         loss_fn=lambda *args, **kwargs: torch.tensor(0.0),
         loss_weight_fn=lambda mb: mb["loss_mask"].count_nonzero(),
         minibatch_idx=4,
+        optimizer_step_scale=optimizer_step_scale,
         collect_logprob_grad_stats=collect_logprob,
     )
 
@@ -619,7 +780,7 @@ def test_train_batch_per_trajectory_uses_single_mb_spec_for_sliced_trajectories(
     def fake_zero_grad():
         events.append(("zero_grad",))
 
-    def fake_optimizer_step():
+    def fake_optimizer_step(*, optimizer_step_scale=1.0):
         events.append(("optimizer_step",))
         return {"update_successful": 1.0, "grad_norm": 7.0, "lr": 0.01}
 
@@ -870,7 +1031,7 @@ def test_train_batch_per_trajectory_filters_over_threshold_grad_norm(monkeypatch
     monkeypatch.setattr(
         engine,
         "optimizer_step",
-        lambda: events.append(("optimizer_step",))
+        lambda *, optimizer_step_scale=1.0: events.append(("optimizer_step",))
         or {"update_successful": 1.0, "grad_norm": 5.0, "lr": 0.01},
     )
     monkeypatch.setattr(engine, "_make_per_trajectory_tracer", lambda _input: tracer)
@@ -966,6 +1127,30 @@ def test_train_batch_per_trajectory_filters_over_threshold_grad_norm(monkeypatch
     assert stats["grad_norm_filter_fraction"] == pytest.approx(0.5)
     assert stats["logp_grad_norm"] == pytest.approx(math.sqrt(2.0))
     assert stats["logp_grad_absmax"] == pytest.approx(1.0)
+
+
+def test_train_batch_per_trajectory_passes_optimizer_step_scale(monkeypatch):
+    engine, input_batched, _tracer, events = _setup_per_trajectory_filter_fixture(
+        monkeypatch,
+        grad_norms=[2.0, 3.0],
+    )
+    received_scales = []
+
+    def fake_optimizer_step(*, optimizer_step_scale=1.0):
+        events.append(("optimizer_step", optimizer_step_scale))
+        received_scales.append(optimizer_step_scale)
+        return {"update_successful": 1.0, "grad_norm": 5.0, "lr": 0.01}
+
+    monkeypatch.setattr(engine, "optimizer_step", fake_optimizer_step)
+
+    _train_per_trajectory_fixture(
+        engine,
+        input_batched,
+        optimizer_step_scale=0.4,
+    )
+
+    assert received_scales == [0.4]
+    assert ("optimizer_step", 0.4) in events
 
 
 def test_train_batch_per_trajectory_all_filtered_skips_optimizer_step(monkeypatch):
@@ -1940,10 +2125,10 @@ def _run_train_with_step_count(engine, method_name, batch, torch):
     original_optimizer_step = engine.optimizer_step
     step_count = 0
 
-    def counted_optimizer_step():
+    def counted_optimizer_step(*, optimizer_step_scale=1.0):
         nonlocal step_count
         step_count += 1
-        return original_optimizer_step()
+        return original_optimizer_step(optimizer_step_scale=optimizer_step_scale)
 
     engine.optimizer_step = counted_optimizer_step
     try:

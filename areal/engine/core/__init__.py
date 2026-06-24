@@ -23,6 +23,8 @@ from areal.engine.core.train_engine import (
     aggregate_eval_losses,
     compute_total_loss_weight,
     reorder_and_pad_outputs,
+    temporary_optimizer_lr_scale,
+    validate_optimizer_step_scale,
 )
 
 __all__ = [
@@ -43,5 +45,7 @@ __all__ = [
     "reorder_and_pad_outputs",
     "slice_trajectory",
     "summarize_logprobs",
+    "temporary_optimizer_lr_scale",
     "trajectory_id_from_sample",
+    "validate_optimizer_step_scale",
 ]

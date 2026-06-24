@@ -63,6 +63,8 @@ from areal.engine.core import (
     aggregate_eval_losses,
     compute_total_loss_weight,
     reorder_and_pad_outputs,
+    temporary_optimizer_lr_scale,
+    validate_optimizer_step_scale,
 )
 from areal.engine.core.distributed import (
     init_custom_process_group,
@@ -686,11 +688,7 @@ class FSDPEngine(TrainEngine):
 
     def _run_optimizer_step_with_lr_scale(self, optimizer_step_scale: float) -> None:
         assert self.optimizer is not None
-        base_lrs = [group["lr"] for group in self.optimizer.param_groups]
-        try:
-            if optimizer_step_scale != 1.0:
-                for group, base_lr in zip(self.optimizer.param_groups, base_lrs):
-                    group["lr"] = base_lr * optimizer_step_scale
+        with temporary_optimizer_lr_scale(self.optimizer, optimizer_step_scale):
             if self.config.fsdp.per_layer_optim_step:
                 assert self._per_layer_optim_wrapper is not None
                 with trace_scope("fsdp_engine.step"):
@@ -698,16 +696,9 @@ class FSDPEngine(TrainEngine):
             else:
                 with trace_scope("fsdp_engine.step"):
                     self.optimizer.step()
-        finally:
-            for group, base_lr in zip(self.optimizer.param_groups, base_lrs):
-                group["lr"] = base_lr
 
     def optimizer_step(self, optimizer_step_scale: float = 1.0):
-        if not math.isfinite(float(optimizer_step_scale)) or optimizer_step_scale < 0:
-            raise ValueError(
-                f"optimizer_step_scale must be a finite non-negative value, "
-                f"got {optimizer_step_scale}"
-            )
+        validate_optimizer_step_scale(optimizer_step_scale)
 
         assert self.optimizer is not None
         assert self.optimizer_config is not None

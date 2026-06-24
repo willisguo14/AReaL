@@ -58,7 +58,9 @@ from areal.engine.core import (
     reorder_and_pad_outputs,
     slice_trajectory,
     summarize_logprobs,
+    temporary_optimizer_lr_scale,
     trajectory_id_from_sample,
+    validate_optimizer_step_scale,
 )
 from areal.engine.core.distributed import (
     init_custom_process_group,
@@ -185,6 +187,8 @@ class _MegatronModelList(list):
 
 
 class MegatronEngine(TrainEngine):
+    supports_optimizer_step_scale = True
+
     def __init__(self, config: TrainEngineConfig):
         self.config = config
         self.hf_config: PretrainedConfig
@@ -937,9 +941,11 @@ class MegatronEngine(TrainEngine):
         for model in self.model:
             model.zero_grad_buffer()
 
-    def optimizer_step(self):
-        with trace_scope("megatron_engine.step"):
-            update_successful, grad_norm, _ = self.optimizer.step()
+    def optimizer_step(self, optimizer_step_scale: float = 1.0):
+        validate_optimizer_step_scale(optimizer_step_scale)
+        with temporary_optimizer_lr_scale(self.optimizer, optimizer_step_scale):
+            with trace_scope("megatron_engine.step"):
+                update_successful, grad_norm, _ = self.optimizer.step()
         current_lr = self.optimizer.param_groups[0]["lr"]
 
         return dict(
@@ -1057,6 +1063,7 @@ class MegatronEngine(TrainEngine):
         input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        optimizer_step_scale: float = 1.0,
         collect_logprob_grad_stats: bool = False,
     ) -> dict[str, float]:
         self._ensure_ready()
@@ -1128,7 +1135,7 @@ class MegatronEngine(TrainEngine):
         )
 
         # Step 5: Optimizer step
-        stats = self.optimizer_step()
+        stats = self.optimizer_step(optimizer_step_scale=optimizer_step_scale)
         grad_cos_sim = self.grad_cosine_tracker.finalize(
             grad_cosine_pending,
             update_successful=stats.get("update_successful", 0.0) == 1.0,
@@ -1158,6 +1165,7 @@ class MegatronEngine(TrainEngine):
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
         *,
         minibatch_idx: int,
+        optimizer_step_scale: float = 1.0,
         collect_logprob_grad_stats: bool = False,
     ) -> dict[str, float]:
         self._ensure_ready()
@@ -1396,7 +1404,7 @@ class MegatronEngine(TrainEngine):
                     device=self.device,
                 )
 
-                stats = self.optimizer_step()
+                stats = self.optimizer_step(optimizer_step_scale=optimizer_step_scale)
                 grad_cos_sim = self.grad_cosine_tracker.finalize(
                     grad_cosine_pending,
                     update_successful=stats.get("update_successful", 0.0) == 1.0,

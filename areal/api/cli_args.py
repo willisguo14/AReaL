@@ -1711,11 +1711,6 @@ class PPOActorConfig(TrainEngineConfig):
                     "actor.per_trajectory.enabled does not support m2_threshold "
                     "in v0 because M2PO masking is batch-coupled."
                 )
-            if self.ess_scaling is not None:
-                raise ValueError(
-                    "actor.per_trajectory.enabled does not support ess_scaling "
-                    "in v0 because Megatron optimizer_step_scale is unsupported."
-                )
             if self.mb_spec.granularity != 1:
                 raise ValueError(
                     "actor.per_trajectory.enabled requires actor.mb_spec.granularity == 1 "

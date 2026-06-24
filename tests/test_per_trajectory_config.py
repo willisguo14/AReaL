@@ -57,14 +57,16 @@ def test_enabled_per_trajectory_rejects_m2():
         )
 
 
-def test_enabled_per_trajectory_rejects_ess_scaling():
-    with pytest.raises(ValueError, match="ess_scaling"):
-        PPOActorConfig(
-            per_trajectory=PerTrajectoryConfig(enabled=True),
-            disable_dropout=True,
-            use_decoupled_loss=True,
-            ess_scaling=ESSScalingConfig(),
-        )
+def test_enabled_per_trajectory_accepts_ess_scaling():
+    config = PPOActorConfig(
+        per_trajectory=PerTrajectoryConfig(enabled=True),
+        disable_dropout=True,
+        use_decoupled_loss=True,
+        ess_scaling=ESSScalingConfig(),
+    )
+
+    assert config.per_trajectory.enabled is True
+    assert config.ess_scaling is not None
 
 
 def test_enabled_per_trajectory_rejects_microbatch_granularity_grouping():

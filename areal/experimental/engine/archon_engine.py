@@ -43,6 +43,7 @@ from areal.engine.core.train_engine import (
     aggregate_eval_losses,
     compute_total_loss_weight,
     reorder_and_pad_outputs,
+    validate_optimizer_step_scale,
 )
 from areal.engine.fsdp_utils.grad import fsdp2_clip_grad_norm
 from areal.experimental.engine.archon_checkpoint import (
@@ -476,8 +477,14 @@ class ArchonEngine(TrainEngine):
         assert self.optimizer is not None
         self.optimizer.zero_grad()
 
-    def optimizer_step(self):
+    def _reject_optimizer_step_scale(self, optimizer_step_scale: float) -> None:
+        scale = validate_optimizer_step_scale(optimizer_step_scale)
+        if scale != 1.0:
+            raise RuntimeError("ArchonEngine does not support optimizer_step_scale.")
+
+    def optimizer_step(self, optimizer_step_scale: float = 1.0):
         """Perform optimizer step with gradient clipping."""
+        self._reject_optimizer_step_scale(optimizer_step_scale)
         assert self.optimizer is not None
         assert self.optimizer_config is not None
         assert self.lr_scheduler is not None
@@ -527,8 +534,10 @@ class ArchonEngine(TrainEngine):
         input_: list[dict[str, Any]] | dict[str, Any],
         loss_fn: Callable[..., torch.Tensor],
         loss_weight_fn: Callable[[dict[str, Any]], torch.Tensor],
+        optimizer_step_scale: float = 1.0,
     ) -> dict[str, float]:
         """Train on a batch of data."""
+        self._reject_optimizer_step_scale(optimizer_step_scale)
         assert self._initialized
         self.optimizer_zero_grad()
 
